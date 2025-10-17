@@ -1,4 +1,4 @@
-name: Build GoPro Graber
+name: Build and Release GoPro Graber
 
 on:
   push:
@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     steps:
     - name: Checkout repository
@@ -16,7 +18,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.14'
+        python-version: '3.11'
 
     - name: Install dependencies
       run: |
@@ -26,8 +28,7 @@ jobs:
     - name: Build the executable
       run: pyinstaller --onefile --name GoProGraber --icon=icon.ico GP_graber.py
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
+    - name: Create Release and Upload Asset
+      uses: softprops/action-gh-release@v1
       with:
-        name: GoProGraber-exe
-        path: dist/GoProGraber.exe
+        files: dist/GoProGraber.exe
