@@ -16,7 +16,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.11'
+        python-version: '3.14'
 
     - name: Install dependencies
       run: |
@@ -27,7 +27,7 @@ jobs:
       run: pyinstaller --onefile --name GoProGraber --icon=icon.ico GP_graber.py
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: GoProGraber-exe
         path: dist/GoProGraber.exe
