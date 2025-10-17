@@ -1,0 +1,33 @@
+name: Build GoPro Graber
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install bleak httpx tqdm pyinstaller
+
+    - name: Build the executable
+      run: pyinstaller --onefile --name GoProGraber --icon=icon.ico GP_graber.py
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: GoProGraber-exe
+        path: dist/GoProGraber.exe

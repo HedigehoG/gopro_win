@@ -1,0 +1,20 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build artifacts
+build/
+bin/
+*.spec
+
+# VSCode specific files
+.vscode/
+
+# Configuration files - check for secrets before committing
+config.ini
+icon.svg
