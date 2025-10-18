@@ -10,6 +10,7 @@ import configparser
 import zipfile
 import io
 import locale
+import tempfile
 from pathlib import Path
 import ctypes
 from ctypes import wintypes
@@ -271,39 +272,19 @@ async def connect_ble(notification_handler: noti_handler_T, identifier: str | No
         logging.error("Камера GoPro не найдена. Убедитесь, что камера включена и сопряжена с компьютером.")
         return None, None, None
 
-    client = BleakClient(matched_device)
+    client = BleakClient(matched_device,pair=True)
     try:
         logging.debug(f"Установка BLE-соединения с {matched_device.name}...")
         await client.connect(timeout=12)
         logging.debug("BLE-соединение установлено!")
 
-        # Попытка сопряжения (на некоторых ОС это может не поддерживаться)
-        logging.debug("Попытка сопряжения с устройством...")
-        paired = False
-        try:
-            # Явно запрашиваем шифрование. Это может решить ошибку "требуется проверка подлинности" в Windows.
-            # 1: None, 2: Encryption, 3: EncryptionAndAuthentication
-            paired = await client.pair(protection_level=3)
-            if paired:
-                logging.debug("Сопряжение с камерой успешно выполнено.")
-            else:
-                logging.error("Сопряжение не было завершено. Это необходимо для работы скрипта.")
-        except NotImplementedError:
-            logging.warning("Программное сопряжение не поддерживается на этой ОС. Убедитесь, что камера сопряжена через системные настройки Bluetooth.")
-            paired = True # Позволяем продолжить, надеясь на системное сопряжение
-        except (BleakError, OSError) as e:
-            logging.error(f"Ошибка во время сопряжения: {e}")
-            logging.error("Убедитесь, что камера находится в режиме сопряжения (Настройки -> Подключения -> Подключить устройство -> GoPro Quik App).")
-
-        if not paired:
-            return None, None, None
+        # Даем стеку Bluetooth время на стабилизацию.
+        await asyncio.sleep(1.0)
 
         # Пауза и явное обнаружение сервисов для надежности.
         # Некоторые камеры медленно инициализируют свои BLE сервисы после подключения/сопряжения.
-        logging.debug("Ожидание установки шифрования и обнаружение сервисов...")
-        # Пауза, чтобы дать Windows время на установку шифрования, прежде чем мы начнем опрашивать сервисы.
-        await asyncio.sleep(1.0)
-
+        logging.debug("Обнаружение сервисов...")
+        
         # Активно пытаемся обнаружить сервисы в течение нескольких секунд.
         # Это решает проблему, когда камера засыпает или сервисы появляются с задержкой.
         services_found = False
@@ -329,10 +310,31 @@ async def connect_ble(notification_handler: noti_handler_T, identifier: str | No
             logging.error("Не удалось обнаружить сервисы GoPro. Возможно, камера уснула или используется несовместимая модель.")
             return None, None, None
             
-        # Включаем уведомления
-        logging.debug("Включение уведомлений от камеры...")
-        await client.start_notify(OG_COMMAND_RESPONSE_UUID, notification_handler)
-        await client.start_notify(OG_SETTINGS_RESPONSE_UUID, notification_handler)
+        # Включаем уведомления. Этот шаг требует аутентификации и должен автоматически
+        # инициировать сопряжение в ОС, если оно еще не было выполнено.
+        try:
+            logging.debug("Включение уведомлений от камеры (это может вызвать запрос на сопряжение в Windows)...")
+            await client.start_notify(OG_COMMAND_RESPONSE_UUID, notification_handler)
+            await client.start_notify(OG_SETTINGS_RESPONSE_UUID, notification_handler)
+            logging.debug("Уведомления успешно включены.")
+        except BleakError as e:
+            if "Insufficient Authentication" in str(e) or "Protocol Error 0x05" in str(e):
+                logging.error("="*80)
+                logging.error("  ОШИБКА: РАССИНХРОНИЗАЦИЯ СОПРЯЖЕНИЯ С КАМЕРОЙ.")
+                logging.error("  Это часто происходит, если сопряжение было удалено на ПК, но не на камере.")
+                logging.error("")
+                logging.error("  ЧТО ДЕЛАТЬ:")
+                logging.error("  1. Удалите камеру GoPro из списка Bluetooth-устройств в Windows.")
+                logging.error("  2. На самой камере выполните сброс соединений:")
+                logging.error("     Настройки -> Подключения -> Сброс подключений (Reset Connections).")
+                logging.error("  3. Перезапустите этот скрипт. Он должен будет создать новое, чистое сопряжение.")
+                logging.error("="*80)
+                return None, None, None
+            else:
+                # Другая, неожиданная ошибка Bleak
+                logging.error(f"Неожиданная ошибка Bleak при включении уведомлений: {e}")
+                # Перевызываем исключение, так как оно не связано с сопряжением
+                raise RuntimeError("Критическая ошибка при включении уведомлений BLE.") from e
 
         logging.debug("Регистрация клиента на камере (Third Party Client Info)...")
         await client.write_gatt_char(OG_COMMAND_REQUEST_UUID, OG_SET_THIRD_PARTY_CLIENT_INFO)
@@ -397,7 +399,7 @@ async def control_wifi_ap(client: BleakClient, matched_device: BleakDevice, stat
         client = await ensure_client_connected(None, matched_device, state.notification_handler)
         await client.write_gatt_char(OG_COMMAND_REQUEST_UUID, command)
     try:
-        status = await asyncio.wait_for(future, timeout=7)
+        status = await asyncio.wait_for(future, timeout=10)
         if status == 0:
             logging.debug(f"Команда Wi-Fi AP ({action}) успешно выполнена.")
         else:
@@ -946,8 +948,7 @@ if is_windows:
             </sharedKey>
         </security>
     </MSM>
-</WLANProfile>
-"""
+</WLANProfile>"""
 
     async def get_wifi_interface_windows() -> str | None:
         """Возвращает имя (описание) первого активного Wi-Fi интерфейса."""
@@ -1064,59 +1065,74 @@ if is_windows:
 
     async def switch_wifi_windows(ssid: str, password: str | None = None, timeout: int = 15, interface: str | None = None, verify_gopro: bool = True) -> bool:
         """
-        Подключается к указанной Wi-Fi сети в Windows, используя WinAPI для подключения.
+        Подключается к указанной Wi-Fi сети в Windows.
+        Для сетей GoPro (когда передан пароль) принудительно обновляет профиль.
+        Для домашних сетей (когда пароль не передан) использует существующий профиль.
         """
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
 
-        # --- Этап 1: Убедиться, что профиль Wi-Fi существует ---
-        profile_exists = False
-        check_profile_cmd = ["netsh", "wlan", "show", "profile", f"name={ssid}"]
-        try:
-            proc = await asyncio.create_subprocess_exec(*check_profile_cmd, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await proc.wait()
-            if proc.returncode == 0:
-                profile_exists = True
-                logging.debug(f"Профиль для Wi-Fi '{ssid}' уже существует.")
-        except Exception as e:
-            logging.warning(f"Ошибка при проверке профиля Wi-Fi: {e}")
+        # --- Этап 1: Управление профилем Wi-Fi ---
+        
+        # Если есть пароль (т.е. подключаемся к GoPro), принудительно обновляем профиль
+        if password:
+            logging.debug(f"Принудительное обновление профиля Wi-Fi для '{ssid}'...")
+            
+            # 1. Удаляем старый профиль (игнорируем ошибки, если его нет)
+            try:
+                del_profile_cmd = ["netsh", "wlan", "delete", "profile", f"name={ssid}"]
+                del_proc = await asyncio.create_subprocess_exec(*del_profile_cmd, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                await del_proc.wait()
+                if del_proc.returncode == 0:
+                    logging.debug(f"Существующий профиль для '{ssid}' удален для обновления.")
+            except Exception:
+                pass # Ошибки здесь ожидаемы и не критичны
 
-        if not profile_exists:
-            if password:
-                logging.info(f"Профиль для '{ssid}' не найден. Попытка создать его с полученным паролем...")
-                # Попытка удалить старый/неверный профиль перед созданием нового
-                try:
-                    del_profile_cmd = ["netsh", "wlan", "delete", "profile", f"name={ssid}"]
-                    del_proc = await asyncio.create_subprocess_exec(*del_profile_cmd, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    await del_proc.wait()
-                except Exception:
-                    pass # Ошибки здесь ожидаемы, если профиля нет
+            # 2. Создаем новый профиль с актуальным паролем
+            profile_xml = create_wifi_profile_xml(ssid, password)
+            profile_created = False
+            try:
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.xml', encoding='utf-8') as tmp:
+                    tmp.write(profile_xml)
+                    profile_path_str = tmp.name
+                
+                add_profile_cmd = ["netsh", "wlan", "add", "profile", f"filename={profile_path_str}"]
+                add_proc = await asyncio.create_subprocess_exec(*add_profile_cmd, startupinfo=startupinfo, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                _add_stdout, add_stderr = await add_proc.communicate()
+                
+                if add_proc.returncode == 0:
+                    logging.info(f"Профиль для '{ssid}' успешно создан/обновлен.")
+                    profile_created = True
+                else:
+                    add_err_msg = add_stderr.decode(CONSOLE_OUTPUT_CP, errors='ignore').strip()
+                    logging.error(f"Не удалось создать/обновить профиль Wi-Fi: {add_err_msg}")
+            except Exception as e:
+                logging.error(f"Ошибка при создании профиля Wi-Fi из временного файла: {e}")
+            finally:
+                if 'profile_path_str' in locals() and os.path.exists(profile_path_str):
+                    os.remove(profile_path_str)
 
-                profile_xml = create_wifi_profile_xml(ssid, password)
-                profile_path = Path(f"{ssid}-wlan-profile.xml")
-                try:
-                    profile_path.write_text(profile_xml, encoding='utf-8')
-                    add_profile_cmd = ["netsh", "wlan", "add", "profile", f"filename={profile_path.resolve()}"]
-                    add_proc = await asyncio.create_subprocess_exec(*add_profile_cmd, startupinfo=startupinfo, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    _add_stdout, add_stderr = await add_proc.communicate()
-                    if add_proc.returncode == 0:
-                        logging.info(f"Профиль для '{ssid}' успешно создан.")
-                        profile_exists = True
-                    else:
-                        add_err_msg = add_stderr.decode(CONSOLE_OUTPUT_CP, errors='ignore').strip()
-                        logging.error(f"Не удалось создать профиль Wi-Fi: {add_err_msg}")
-                        return False
-                finally:
-                    if profile_path.exists(): profile_path.unlink()
-            else:
-                logging.error(f"Профиль для сети Wi-Fi '{ssid}' не найден в Windows, и пароль не был получен с камеры.")
-                logging.error("РЕШЕНИЕ: Пожалуйста, подключитесь к этой сети вручную через меню Wi-Fi Windows хотя бы один раз.")
+            if not profile_created:
                 return False
+        else:
+            # Нет пароля, значит, это возврат к домашней сети.
+            # Просто проверяем, существует ли профиль. Если нет, мы не можем подключиться.
+            logging.debug(f"Попытка подключения к '{ssid}' с использованием существующего профиля.")
+            profile_exists = False
+            check_profile_cmd = ["netsh", "wlan", "show", "profile", f"name={ssid}"]
+            try:
+                proc = await asyncio.create_subprocess_exec(*check_profile_cmd, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                await proc.wait()
+                if proc.returncode == 0:
+                    profile_exists = True
+            except Exception as e:
+                logging.warning(f"Ошибка при проверке профиля Wi-Fi для '{ssid}': {e}")
 
-        if not profile_exists:
-            logging.error(f"Не удалось найти или создать профиль для '{ssid}'.")
-            return False
+            if not profile_exists:
+                logging.error(f"Профиль для домашней сети Wi-Fi '{ssid}' не найден в Windows.")
+                logging.error("Не удалось вернуться к исходной сети. Пожалуйста, подключитесь вручную.")
+                return False
 
         # --- Этап 2: Подключение к сети с помощью WinAPI ---
         hClient = wintypes.HANDLE()
@@ -1258,9 +1274,10 @@ async def download_ffmpeg_windows(target_dir: Path, input_queue: asyncio.Queue) 
     FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
     
     print("\n---")
-    print("Утилита ffmpeg не найдена.")
-    print(f"Скачать последнюю версию для Windows с gyan.dev? (около 100 МБ)")
-    print("Введите 'y' для скачивания или любую другую клавишу для отмены: ", end="", flush=True)
+    print("Утилита ffmpeg не найдена. Она необходима для склейки и переименования видео.")
+    print(f"Скачать последнюю версию для Windows с gyan.dev? (архив ~100 МБ)")
+    print("Нажмите 'y' для скачивания. Любая другая клавиша - пропустить и продолжить.")
+    print("Ваш выбор: ", end="", flush=True)
     
     # Очищаем очередь от случайных нажатий
     while not input_queue.empty():
@@ -1320,7 +1337,7 @@ async def download_ffmpeg_windows(target_dir: Path, input_queue: asyncio.Queue) 
         logging.error(f"Ошибка при скачивании или распаковке ffmpeg: {e}")
         return None
 
-DEFAULT_CONFIG = """[General]
+DEFAULT_CONFIG = r"""[General]
 # Identifier: последние 4 символа серийного номера GoPro (часть имени сети).
 # Оставьте пустым для автоматического определения.
 identifier = 
@@ -1345,7 +1362,7 @@ mode = full
 session_gap_hours = 2
 
 # FileNameFormat: формат имени файла. Использует стандартные директивы strftime.
-# Недопустимые для имен файлов символы (например, \\ / : * ? " < > |) будут заменены на '_'.
+# Недопустимые для имен файлов символы (например, \ / : * ? " < > |) будут заменены на '_'.
 # %y=год(2), %Y=год(4), %m=месяц, %d=день, %H=час, %M=минута, %S=секунда
 # Пример для '2025-09-09_10-02.mp4': %Y-%m-%d_%H-%M
 filename_format = %Y-%m-%d_%H_%M
@@ -1463,8 +1480,6 @@ async def input_and_cancel_handler_windows(main_task: asyncio.Task, input_queue:
     import msvcrt
     loop = asyncio.get_event_loop()
     
-    print("\n(Для отмены операции в любой момент нажмите клавишу 'Escape')")
-    
     while not main_task.done():
         try:
             if await loop.run_in_executor(None, msvcrt.kbhit):
@@ -1488,6 +1503,13 @@ async def main() -> None:
     if '--help' in sys.argv or '-h' in sys.argv:
         show_help()
         return
+
+    # Сообщение о возможности отмены выводится в самом начале
+    if platform.system() == "Windows":
+        print("\n" + "="*80)
+        print("    (Для отмены операции в любой момент нажмите клавишу 'Escape')")
+        print("="*80)
+
     asyncio.get_event_loop().set_exception_handler(exception_handler)
     wifi_keep_alive_hdl: asyncio.Task | None = None
     disk_keep_alive_hdl: asyncio.Task | None = None
@@ -1791,1053 +1813,7 @@ async def main() -> None:
 
         # Логика принудительного выключения камеры удалена по запросу.
         # Скрипт будет полагаться на автоматическое выключение камеры.
-        if mode != 'process_only':
-            logging.info("Процесс завершен. Камера должна выключиться автоматически.")
-        else:
-            logging.debug("Блок finally: режим process_only, действия с камерой не требуются.")
-
-        # Возвращаемся на домашний Wi-Fi
-        if is_windows and connected_to_gopro_wifi:
-            target_ssid = home_wifi or original_ssid
-            if target_ssid:
-                logging.info(f"Возврат к исходной сети '{target_ssid}'...")
-                await switch_wifi_windows(target_ssid, timeout=15, interface=wifi_interface, verify_gopro=False)
-            else:
-                logging.debug("Блок finally: Не найдено имя исходной сети для возврата.")
-        else:
-            logging.debug("Блок finally: Возврат к исходной сети Wi-Fi не требуется (переключения не было или не Windows).")
-
-        logging.debug("Блок finally: завершение.")
-
-    logging.info("✅ Готово!")
-
-
-if __name__ == "__main__":
-    exit_code = 0
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        # asyncio.run() перехватывает KeyboardInterrupt, отменяет задачу и затем снова его вызывает.
-        # Так как мы обрабатываем прерывание в main(), здесь нам нужно просто тихо выйти,
-        # чтобы избежать вывода "необработанного прерывания".
-        pass # exit_code остается 0
-    except (RuntimeError, asyncio.TimeoutError, ValueError) as e:
-        logging.error(f"Ошибка выполнения: {e}")
-        exit_code = 1
-    finally:
-        # Если скрипт запущен как .exe, ждем нажатия клавиши или таймаута перед закрытием
-        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-            import time
-            import msvcrt
-
-            # Загружаем настройку автозакрытия окна
-            auto_close = False
-            auto_close_delay = 5  # секунд для auto_close=yes
-            manual_close_timeout = 60 # секунд для auto_close=no
-
-            try:
-                config_path = Path("config.ini")
-                if config_path.exists():
-                    config = configparser.ConfigParser()
-                    config.read(config_path, encoding='utf-8')
-                    auto_close = config.getboolean('Advanced', 'auto_close_window', fallback=False)
-            except Exception:
-                # В случае ошибки при чтении конфига, придерживаемся безопасного поведения
-                pass
-
-            if auto_close:
-                print(f"\nОкно закроется через {auto_close_delay} секунд...")
-                time.sleep(auto_close_delay)
-            else:
-                print(f"\nНажмите Enter для закрытия или подождите {manual_close_timeout} секунд...")
-                start_time = time.time()
-                while time.time() - start_time < manual_close_timeout:
-                    if msvcrt.kbhit() and msvcrt.getch() in (b'\r', b'\n'):
-                        break
-                    time.sleep(0.2)  # Предотвращаем загрузку CPU
-    
-    sys.exit(exit_code)
-
-def touch_files(output_folder: Path, downloaded_files: list[dict[str, Any]]):
-    """Устанавливает дату модификации файлов равной дате съемки из API."""
-    logging.info("Режим 'touch_only': обновление временных меток файлов...")
-    
-    touched_count = 0
-    for file_meta in tqdm(downloaded_files, desc="Обновление дат", ncols=100):
-        file_path = output_folder / file_meta["n"]
-        timestamp = file_meta.get("mod")
-        
-        if timestamp and timestamp > 0 and file_path.exists():
-            try:
-                os.utime(file_path, (timestamp, timestamp))
-                touched_count += 1
-            except Exception as e:
-                logging.warning(f"Не удалось обновить дату для '{file_path.name}': {e}")
-    logging.info(f"Обновлены временные метки для {touched_count} файлов.")
-
-async def wifi_keep_alive_task(stop_event: asyncio.Event) -> None:
-    """Периодически пингует камеру по Wi-Fi, чтобы предотвратить ее засыпание."""
-    logging.debug("Задача Wi-Fi keep-alive запущена.")
-    # Используем новый эндпоинт Open GoPro, т.к. старый /gp/command/wireless/ping не работает на всех моделях.
-    ping_url = f"{GOPRO_BASE_URL}/gopro/camera/keep_alive"
-    async with httpx.AsyncClient(timeout=10) as client:
-        while not stop_event.is_set():
-            try:
-                # Ждем 15 секунд. Если stop_event будет установлен, выйдем раньше.
-                await asyncio.wait_for(stop_event.wait(), timeout=15)
-            except asyncio.TimeoutError:
-                # Таймаут означает, что пора отправить пинг
-                try:
-                    logging.debug("Отправка Wi-Fi keep-alive ping...")
-                    await client.get(ping_url)
-                except httpx.RequestError as e:
-                    logging.warning(f"Не удалось отправить Wi-Fi keep-alive (соединение может быть потеряно): {e}")
-    logging.debug("Задача Wi-Fi keep-alive остановлена.")
-
-# --- Native Windows Wi-Fi Scanning (ctypes) ---
-# Этот раздел реализует сканирование Wi-Fi через WinAPI, что быстрее и надежнее,
-# чем парсинг вывода 'netsh'.
-is_windows = platform.system() == "Windows"
-
-if is_windows:
-    from xml.sax.saxutils import escape
-    wlanapi = ctypes.WinDLL("wlanapi.dll")
-    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
- 
-    # Определяем кодировку вывода консоли для корректного декодирования вывода netsh.
-    try:
-        CONSOLE_OUTPUT_CP = f'cp{kernel32.GetConsoleOutputCP()}'
-    except Exception:
-        # Резервный вариант для русского Windows, если GetConsoleOutputCP не удался.
-        CONSOLE_OUTPUT_CP = 'cp866'
- 
-    # Constants for SetThreadExecutionState to prevent sleep
-    ES_CONTINUOUS = 0x80000000
-    ES_SYSTEM_REQUIRED = 0x00000001
-    ES_DISPLAY_REQUIRED = 0x00000002
- 
-    kernel32.SetThreadExecutionState.argtypes = [wintypes.DWORD]
-    kernel32.SetThreadExecutionState.restype = wintypes.DWORD
- 
-    class DOT11_SSID(ctypes.Structure):
-        _fields_ = [
-            ("uSSIDLength", wintypes.DWORD),
-            ("ucSSID", ctypes.c_char * 32),
-        ]
- 
-    class WLAN_RATE_SET(ctypes.Structure):
-        _fields_ = [
-            ("uRateSetLength", wintypes.DWORD),
-            ("usRateSet", wintypes.WORD * 126)
-        ]
- 
-    class WLAN_BSS_ENTRY(ctypes.Structure):
-        _fields_ = [
-            ("dot11Ssid", DOT11_SSID),
-            ("uPhyId", wintypes.DWORD),
-            ("dot11Bssid", ctypes.c_ubyte * 6),
-            ("dot11BssType", wintypes.DWORD),
-            ("dot11BssPhyType", wintypes.DWORD),
-            ("lRssi", ctypes.c_long),
-            ("uLinkQuality", wintypes.DWORD),
-            ("bInRegDomain", ctypes.c_bool),
-            ("usBeaconPeriod", wintypes.WORD),
-            ("ullTimestamp", ctypes.c_ulonglong),
-            ("ullHostTimestamp", ctypes.c_ulonglong),
-            ("usCapabilityInformation", wintypes.WORD),
-            ("ulChCenterFrequency", wintypes.DWORD),
-            ("wlanRateSet", WLAN_RATE_SET),
-            ("ulIeOffset", wintypes.DWORD),
-            ("ulIeSize", wintypes.DWORD),
-        ]
- 
-    class WLAN_BSS_LIST(ctypes.Structure):
-        _fields_ = [
-            ("dwTotalSize", wintypes.DWORD),
-            ("dwNumberOfItems", wintypes.DWORD),
-            ("wlanBssEntries", WLAN_BSS_ENTRY * 1),
-        ]
- 
-    class WLAN_INTERFACE_INFO(ctypes.Structure):
-        _fields_ = [
-            ("InterfaceGuid", ctypes.c_byte * 16),
-            ("strInterfaceDescription", wintypes.WCHAR * 256),
-            ("isState", wintypes.DWORD),
-        ]
- 
-    class WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
-        _fields_ = [
-            ("dwNumberOfItems", wintypes.DWORD),
-            ("dwIndex", wintypes.DWORD),
-            ("InterfaceInfo", WLAN_INTERFACE_INFO * 1),
-        ]
- 
-    # Константы и структуры для WlanConnect
-    wlan_connection_mode_profile = 0
-    dot11_BSS_type_infrastructure = 1
-
-    class WLAN_CONNECTION_PARAMETERS(ctypes.Structure):
-        _fields_ = [
-            ('wlanConnectionMode', wintypes.DWORD), # WLAN_CONNECTION_MODE enum
-            ('strProfile', wintypes.LPWSTR),
-            ('pDot11Ssid', ctypes.POINTER(DOT11_SSID)),
-            ('pDesiredBssidList', ctypes.c_void_p), # Pointer to DOT11_BSSID_LIST
-            ('dot11BssType', wintypes.DWORD),       # DOT11_BSS_TYPE enum
-            ('dwFlags', wintypes.DWORD)
-        ]
-
-    wlanapi.WlanFreeMemory.argtypes = [ctypes.c_void_p]
-    wlanapi.WlanCloseHandle.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
-    wlanapi.WlanConnect.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_byte * 16), ctypes.POINTER(WLAN_CONNECTION_PARAMETERS), ctypes.c_void_p]
-    wlanapi.WlanConnect.restype = wintypes.DWORD
-
-    def create_wifi_profile_xml(ssid: str, password: str) -> str:
-        """Создает XML-строку для профиля Wi-Fi WPA2-PSK."""
-        safe_ssid = escape(ssid)
-        safe_password = escape(password)
-        return f"""<?xml version="1.0"?>
-<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
-    <name>{safe_ssid}</name>
-    <SSIDConfig>
-        <SSID>
-            <name>{safe_ssid}</name>
-        </SSID>
-    </SSIDConfig>
-    <connectionType>ESS</connectionType>
-    <connectionMode>auto</connectionMode>
-    <MSM>
-        <security>
-            <authEncryption>
-                <authentication>WPA2PSK</authentication>
-                <encryption>AES</encryption>
-                <useOneX>false</useOneX>
-            </authEncryption>
-            <sharedKey>
-                <keyType>passPhrase</keyType>
-                <protected>false</protected>
-                <keyMaterial>{safe_password}</keyMaterial>
-            </sharedKey>
-        </security>
-    </MSM>
-</WLANProfile>
-"""
-
-    async def get_wifi_interface_windows() -> str | None:
-        """Возвращает имя (описание) первого активного Wi-Fi интерфейса."""
-        hClient = wintypes.HANDLE()
-        pIfList = ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)()
-        try:
-            if wlanapi.WlanOpenHandle(2, None, ctypes.byref(wintypes.DWORD()), ctypes.byref(hClient)) != 0:
-                return None
-            if wlanapi.WlanEnumInterfaces(hClient, None, ctypes.byref(pIfList)) != 0:
-                return None
-            
-            iface_list = pIfList.contents
-            if iface_list.dwNumberOfItems > 0:
-                return iface_list.InterfaceInfo[0].strInterfaceDescription
-            return None
-        finally:
-            if pIfList:
-                wlanapi.WlanFreeMemory(pIfList)
-            if hClient:
-                wlanapi.WlanCloseHandle(hClient, None)
-
-    async def get_current_wifi_ssid_windows() -> str | None:
-        """Возвращает SSID текущей Wi-Fi сети в Windows."""
-        try:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-
-            proc = await asyncio.create_subprocess_exec(
-                "netsh", "wlan", "show", "interfaces",
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo
-            )
-            stdout, stderr = await proc.communicate()
-
-            if proc.returncode != 0:
-                err_msg = stderr.decode(CONSOLE_OUTPUT_CP, errors='ignore').strip()
-                logging.warning(f"Не удалось получить текущий SSID через netsh: {err_msg}")
-                return None
-
-            for line in stdout.decode(CONSOLE_OUTPUT_CP, errors='ignore').splitlines():
-                if "SSID" in line and ":" in line:
-                    ssid = line.split(":", 1)[1].strip()
-                    if ssid:
-                        return ssid
-            return None
-        except FileNotFoundError as e:
-            logging.warning(f"Не удалось получить текущий SSID через netsh: {e}")
-            return None
-
-    async def find_wifi_ssid_windows_native(identifier: str, timeout: int = 15) -> str | None:
-        """
-        Сканирует Wi-Fi сети с помощью WinAPI и ищет SSID, содержащий 'identifier'.
-        Возвращает полное имя SSID в случае успеха.
-        """
-        hClient = wintypes.HANDLE()
-        pIfList = ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)()
-        pBssList = ctypes.c_void_p()
-        
-        try:
-            if wlanapi.WlanOpenHandle(2, None, ctypes.byref(wintypes.DWORD()), ctypes.byref(hClient)) != 0:
-                raise RuntimeError("WlanOpenHandle failed.")
-            
-            if wlanapi.WlanEnumInterfaces(hClient, None, ctypes.byref(pIfList)) != 0:
-                raise RuntimeError("WlanEnumInterfaces failed.")
-                
-            iface_list = pIfList.contents
-            if iface_list.dwNumberOfItems == 0:
-                logging.warning("Wi-Fi интерфейс не найден.")
-                return None
-            iface_guid = iface_list.InterfaceInfo[0].InterfaceGuid
-
-            logging.info(f"Поиск Wi-Fi сети камеры (до {timeout} секунд)...")
-            end_time = asyncio.get_event_loop().time() + timeout
-            
-            while asyncio.get_event_loop().time() < end_time:
-                logging.debug("Запуск нового сканирования Wi-Fi...")
-                if wlanapi.WlanScan(hClient, ctypes.byref(iface_guid), None, None, None) != 0:
-                    logging.warning("Не удалось запустить сканирование Wi-Fi.")
-                
-                # Ждем несколько секунд, пока сканирование завершится и результаты обновятся
-                for _ in range(5): # Проверяем в течение 5 секунд после каждого сканирования
-                    if asyncio.get_event_loop().time() > end_time: break
-                    await asyncio.sleep(1)
-                    if wlanapi.WlanGetNetworkBssList(hClient, ctypes.byref(iface_guid), None, 2, False, None, ctypes.byref(pBssList)) == 0:
-                        bss_list = ctypes.cast(pBssList, ctypes.POINTER(WLAN_BSS_LIST)).contents
-                        
-                        for i in range(bss_list.dwNumberOfItems):
-                            entry_ptr = ctypes.cast(
-                                ctypes.addressof(bss_list.wlanBssEntries) + i * ctypes.sizeof(WLAN_BSS_ENTRY),
-                                ctypes.POINTER(WLAN_BSS_ENTRY)
-                            )
-                            entry = entry_ptr.contents
-                            ssid_len = entry.dot11Ssid.uSSIDLength
-                            ssid = entry.dot11Ssid.ucSSID[:ssid_len].decode('utf-8', errors='ignore')
-                            
-                            if identifier in ssid:
-                                logging.info(f"Найдена сеть GoPro по идентификатору: '{ssid}'")
-                                return ssid
-                        
-                        if pBssList:
-                            wlanapi.WlanFreeMemory(pBssList)
-                            pBssList = ctypes.c_void_p()
-
-            logging.warning(f"Сеть Wi-Fi, содержащая '{identifier}', не найдена после сканирования.")
-            return None
-
-        except Exception as e:
-            logging.error(f"Ошибка при сканировании Wi-Fi сетей: {e}")
-            return None
-        finally:
-            if pBssList: wlanapi.WlanFreeMemory(pBssList)
-            if pIfList: wlanapi.WlanFreeMemory(pIfList)
-            if hClient: wlanapi.WlanCloseHandle(hClient, None)
-
-    async def switch_wifi_windows(ssid: str, password: str | None = None, timeout: int = 15, interface: str | None = None, verify_gopro: bool = True) -> bool:
-        """
-        Подключается к указанной Wi-Fi сети в Windows, используя WinAPI для подключения.
-        """
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = subprocess.SW_HIDE
-
-        # --- Этап 1: Убедиться, что профиль Wi-Fi существует ---
-        profile_exists = False
-        check_profile_cmd = ["netsh", "wlan", "show", "profile", f"name={ssid}"]
-        try:
-            proc = await asyncio.create_subprocess_exec(*check_profile_cmd, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await proc.wait()
-            if proc.returncode == 0:
-                profile_exists = True
-                logging.debug(f"Профиль для Wi-Fi '{ssid}' уже существует.")
-        except Exception as e:
-            logging.warning(f"Ошибка при проверке профиля Wi-Fi: {e}")
-
-        if not profile_exists:
-            if password:
-                logging.info(f"Профиль для '{ssid}' не найден. Попытка создать его с полученным паролем...")
-                # Попытка удалить старый/неверный профиль перед созданием нового
-                try:
-                    del_profile_cmd = ["netsh", "wlan", "delete", "profile", f"name={ssid}"]
-                    del_proc = await asyncio.create_subprocess_exec(*del_profile_cmd, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    await del_proc.wait()
-                except Exception:
-                    pass # Ошибки здесь ожидаемы, если профиля нет
-
-                profile_xml = create_wifi_profile_xml(ssid, password)
-                profile_path = Path(f"{ssid}-wlan-profile.xml")
-                try:
-                    profile_path.write_text(profile_xml, encoding='utf-8')
-                    add_profile_cmd = ["netsh", "wlan", "add", "profile", f"filename={profile_path.resolve()}"]
-                    add_proc = await asyncio.create_subprocess_exec(*add_profile_cmd, startupinfo=startupinfo, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    _add_stdout, add_stderr = await add_proc.communicate()
-                    if add_proc.returncode == 0:
-                        logging.info(f"Профиль для '{ssid}' успешно создан.")
-                        profile_exists = True
-                    else:
-                        add_err_msg = add_stderr.decode(CONSOLE_OUTPUT_CP, errors='ignore').strip()
-                        logging.error(f"Не удалось создать профиль Wi-Fi: {add_err_msg}")
-                        return False
-                finally:
-                    if profile_path.exists(): profile_path.unlink()
-            else:
-                logging.error(f"Профиль для сети Wi-Fi '{ssid}' не найден в Windows, и пароль не был получен с камеры.")
-                logging.error("РЕШЕНИЕ: Пожалуйста, подключитесь к этой сети вручную через меню Wi-Fi Windows хотя бы один раз.")
-                return False
-
-        if not profile_exists:
-            logging.error(f"Не удалось найти или создать профиль для '{ssid}'.")
-            return False
-
-        # --- Этап 2: Подключение к сети с помощью WinAPI ---
-        hClient = wintypes.HANDLE()
-        pIfList = ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)()
-        try:
-            if wlanapi.WlanOpenHandle(2, None, ctypes.byref(wintypes.DWORD()), ctypes.byref(hClient)) != 0:
-                raise RuntimeError("WlanOpenHandle failed.")
-            
-            if wlanapi.WlanEnumInterfaces(hClient, None, ctypes.byref(pIfList)) != 0:
-                raise RuntimeError("WlanEnumInterfaces failed.")
-                
-            iface_list = pIfList.contents
-            if iface_list.dwNumberOfItems == 0:
-                logging.warning("Wi-Fi интерфейс не найден.")
-                return False
-            iface_guid_bytes = iface_list.InterfaceInfo[0].InterfaceGuid
-            iface_guid = ctypes.cast(ctypes.byref(iface_guid_bytes), ctypes.POINTER(ctypes.c_byte * 16))
-
-            params = WLAN_CONNECTION_PARAMETERS()
-            params.wlanConnectionMode = wlan_connection_mode_profile
-            params.strProfile = ssid
-            params.dot11BssType = dot11_BSS_type_infrastructure
-
-            log_func = logging.info if verify_gopro else logging.debug
-            log_func(f"Подключаемся к Wi-Fi '{ssid}'...")
-            
-            end_time = asyncio.get_event_loop().time() + timeout
-            connect_spam_interval = 4
-            last_spam_time = 0
-
-            while asyncio.get_event_loop().time() < end_time:
-                current_time = asyncio.get_event_loop().time()
-                if current_time - last_spam_time >= connect_spam_interval:
-                    last_spam_time = current_time
-                    logging.debug(f"Отправка команды WlanConnect для '{ssid}'...")
-                    ret = wlanapi.WlanConnect(hClient, iface_guid, ctypes.byref(params), None)
-                    if ret != 0:
-                        logging.debug(f"WlanConnect вернул код ошибки: {ret}. Это может быть нормально, если сеть еще не видна.")
-
-                await asyncio.sleep(1)
-                current_ssid = await get_current_wifi_ssid_windows()
-                if current_ssid == ssid:
-                    if not verify_gopro:
-                        logging.debug(f"Успешно подключено к Wi-Fi: {ssid}")
-                        return True
-                    if await verify_gopro_connection():
-                        logging.info(f"Успешно подключено к Wi-Fi '{ssid}'.")
-                        return True
-            
-            logging.error(f"Тайм-аут: не удалось подключиться и проверить соединение с '{ssid}' за {timeout} секунд.")
-            return False
-        finally:
-            if pIfList: wlanapi.WlanFreeMemory(pIfList)
-            if hClient: wlanapi.WlanCloseHandle(hClient, None)
-
-    async def verify_gopro_connection() -> bool:
-        """Проверяет доступность GoPro по HTTP после подключения к Wi-Fi."""
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(f"{GOPRO_BASE_URL}/gopro/camera/state", follow_redirects=True)
-                response.raise_for_status()
-            logging.debug("Проверка соединения с камерой по Wi-Fi успешна.")
-            return True
-        except (httpx.RequestError, httpx.HTTPStatusError):
-            logging.debug(f"Не удалось связаться с камерой по адресу {GOPRO_BASE_URL}.")
-            return False
-
-else:
-    # Заглушки для не-Windows систем, чтобы избежать NameError
-    async def get_wifi_interface_windows() -> str | None: return None
-    async def get_current_wifi_ssid_windows() -> str | None: return None
-    async def find_wifi_ssid_windows_native(identifier: str, timeout: int = 30) -> str | None: return None
-    async def switch_wifi_windows(ssid: str, password: str | None = None, timeout: int = 15, interface: str | None = None, verify_gopro: bool = True) -> bool: return False
-    async def verify_gopro_connection() -> bool: return True
-
-if is_windows:
-    async def get_y_n_with_timeout_windows(prompt: str, timeout: int, input_queue: asyncio.Queue) -> bool:
-        """
-        Asks a y/n question with a timeout on Windows, using a shared input queue.
-        Returns True for 'y'/'д', False for 'n'/'н' or timeout.
-        """
-        print(f"\n{prompt} (y/n, {timeout} сек на ответ): ", end="", flush=True)
-
-        try:
-            # Очищаем очередь от случайных нажатий перед началом
-            while not input_queue.empty():
-                input_queue.get_nowait()
-
-            char_byte = await asyncio.wait_for(input_queue.get(), timeout=timeout)
-            
-            # Echo character and add a newline for clean output
-            sys.stdout.buffer.write(char_byte)
-            sys.stdout.buffer.write(b'\r\n')
-            sys.stdout.flush()
-
-            char_lower = char_byte.lower()
-            # 'y' or 'д' (да)
-            if char_lower in (b'y', b'\xa4'):
-                return True
-            # 'n' or 'н' (нет)
-            elif char_lower in (b'n', b'\xad'):
-                return False
-            # Any other key is treated as 'no'
-            return False
-            
-        except asyncio.TimeoutError:
-            print("\nВремя ожидания истекло. Ответ по умолчанию: 'нет'.")
-            return False
-
-def is_ffmpeg_available(ffmpeg_path: str) -> bool:
-    """Проверяет доступность ffmpeg и ffprobe."""
-    try:
-        ffmpeg_p = Path(ffmpeg_path)
-        # ffprobe должен находиться в той же директории, что и ffmpeg
-        ffprobe_p = ffmpeg_p.with_name(ffmpeg_p.name.replace("ffmpeg", "ffprobe"))
-
-        startupinfo = None
-        if platform.system() == "Windows":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        
-        # Проверяем ffmpeg
-        subprocess.run([str(ffmpeg_p), "-version"], capture_output=True, check=True, text=True, startupinfo=startupinfo)
-        
-        # Проверяем ffprobe
-        try:
-            subprocess.run([str(ffprobe_p), "-version"], capture_output=True, check=True, text=True, startupinfo=startupinfo)
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            logging.debug(f"ffmpeg найден ('{ffmpeg_p}'), но ffprobe не найден по ожидаемому пути ('{ffprobe_p}').")
-            logging.debug("ffprobe необходим для обработки видео. Убедитесь, что он находится в той же папке, что и ffmpeg.")
-            return False
-
-        return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
-
-async def download_ffmpeg_windows(target_dir: Path, input_queue: asyncio.Queue) -> str | None:
-    """Скачивает и распаковывает ffmpeg для Windows."""
-    FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-    
-    print("\n---")
-    print("Утилита ffmpeg не найдена.")
-    print(f"Скачать последнюю версию для Windows с gyan.dev? (около 100 МБ)")
-    print("Введите 'y' для скачивания или любую другую клавишу для отмены: ", end="", flush=True)
-    
-    # Очищаем очередь от случайных нажатий
-    while not input_queue.empty():
-        input_queue.get_nowait()
-
-    # Ждем одно нажатие клавиши
-    char_byte = await input_queue.get()
-
-    # Эхо-вывод и перевод строки
-    sys.stdout.buffer.write(char_byte)
-    sys.stdout.buffer.write(b'\r\n')
-    sys.stdout.flush()
-
-    answer_char = char_byte.lower()
-
-    # 'y' or 'д' (да)
-    if answer_char not in (b'y', b'\xa4'):
-        logging.warning("Скачивание ffmpeg отменено пользователем.")
-        return None
-
-    target_dir.mkdir(exist_ok=True, parents=True)
-    
-    logging.info(f"Скачивание ffmpeg с {FFMPEG_URL}...")
-    try:
-        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
-            async with client.stream("GET", FFMPEG_URL) as response:
-                response.raise_for_status()
-                total_size = int(response.headers.get("Content-Length", 0))
-                zip_data = io.BytesIO()
-                
-                with tqdm(total=total_size, unit='B', unit_scale=True, desc="Скачивание ffmpeg", ncols=100) as pbar:
-                    async for chunk in response.aiter_bytes():
-                        zip_data.write(chunk)
-                        pbar.update(len(chunk))
-        
-        logging.info("Распаковка архива...")
-        zip_data.seek(0)
-        with zipfile.ZipFile(zip_data) as zf:
-            ffmpeg_path_in_zip = next((name for name in zf.namelist() if name.endswith("bin/ffmpeg.exe")), None)
-            ffprobe_path_in_zip = next((name for name in zf.namelist() if name.endswith("bin/ffprobe.exe")), None)
-            
-            if not ffmpeg_path_in_zip or not ffprobe_path_in_zip:
-                raise FileNotFoundError("Не удалось найти ffmpeg.exe/ffprobe.exe в скачанном архиве.")
-            
-            ffmpeg_exe_path = target_dir / "ffmpeg.exe"
-            ffprobe_exe_path = target_dir / "ffprobe.exe"
-            
-            with open(ffmpeg_exe_path, "wb") as f:
-                f.write(zf.read(ffmpeg_path_in_zip))
-            
-            with open(ffprobe_exe_path, "wb") as f:
-                f.write(zf.read(ffprobe_path_in_zip))
-                
-            logging.info(f"ffmpeg и ffprobe успешно установлены в '{target_dir}'")
-            return str(ffmpeg_exe_path.resolve())
-    except Exception as e:
-        logging.error(f"Ошибка при скачивании или распаковке ffmpeg: {e}")
-        return None
-
-DEFAULT_CONFIG = """[General]
-# Identifier: последние 4 символа серийного номера GoPro (часть имени сети).
-# Оставьте пустым для автоматического определения.
-identifier = 
-
-# OutputFolder: папка для сохранения медиа.
-output_folder = GoPro_Media
-
-# HomeWifi: имя домашней Wi-Fi сети для возврата ПК после скачивания.
-# Оставьте пустым, если не хотите автоматически переключаться обратно.
-home_wifi = 
-
-[Processing]
-# Mode: режим обработки файлов после скачивания.
-# full:         Скачать, склеить сессии и переименовать по дате (по умолчанию).
-# rename_only:  Скачать и переименовать КАЖДЫЙ файл по дате, не склеивая.
-# download_only:Только скачать файлы с оригинальными именами.
-# touch_only:   Скачать и установить дату файла равной дате съемки (для сторонних программ).
-# process_only: Не скачивать, только обработать уже скачанные файлы в папке.
-mode = full
-
-# SessionGapHours: временной разрыв в часах, который считается новой съемочной сессией.
-session_gap_hours = 2
-
-# FileNameFormat: формат имени файла. Использует стандартные директивы strftime.
-# Недопустимые для имен файлов символы (например, \\ / : * ? " < > |) будут заменены на '_'.
-# %y=год(2), %Y=год(4), %m=месяц, %d=день, %H=час, %M=минута, %S=секунда
-# Пример для '2025-09-09_10-02.mp4': %Y-%m-%d_%H-%M
-filename_format = %Y-%m-%d_%H_%M
-
-# FfmpegPath: путь к исполняемому файлу ffmpeg.
-ffmpeg_path = ffmpeg
-
-[Advanced]
-# WifiWait: секунд ожидания для одной попытки автоматического подключения к Wi-Fi.
-wifi_wait = 30
-
-# AutoCloseWindow: автоматически закрывать окно консоли после завершения работы (только для .exe).
-# yes: Закрывать автоматически.
-# no:  Ожидать нажатия Enter перед закрытием (по умолчанию).
-auto_close_window = no
-
-[Deletion]
-# DeleteAfterDownload: удалять ли файлы с камеры после успешного скачивания.
-# no:  Никогда не удалять.
-# ask: Спрашивать каждый раз (по умолчанию).
-# yes: Всегда удалять без запроса.
-delete_after_download = ask
-"""
-
-def load_config(config_path: Path) -> tuple[dict[str, Any], configparser.ConfigParser]:
-    """Загружает конфигурацию из config.ini. Если файл не существует, создает его с настройками по умолчанию."""
-    config = configparser.ConfigParser(comment_prefixes=('#', ';'), allow_no_value=True, interpolation=None)
-    
-    if not config_path.exists():
-        logging.info(f"Создан файл конфигурации '{config_path}'. Ознакомьтесь с его содержимым и настройте при необходимости.")
-        try:
-            with config_path.open('w', encoding='utf-8') as configfile:
-                configfile.write(DEFAULT_CONFIG)
-        except IOError as e:
-            logging.error(f"Не удалось создать файл конфигурации: {e}")
-            raise
-
-    config.read(config_path, encoding='utf-8')
-
-    settings = {
-        'identifier': config.get('General', 'identifier', fallback=''),
-        'output_folder': config.get('General', 'output_folder', fallback='GoPro_Media'),
-        'home_wifi': config.get('General', 'home_wifi', fallback=''),
-        'mode': config.get('Processing', 'mode', fallback='full').lower(),
-        'session_gap_hours': config.getint('Processing', 'session_gap_hours', fallback=2),
-        'filename_format': config.get('Processing', 'filename_format', fallback='(%Y-%m-%d_%H_%M)'),
-        'ffmpeg_path': config.get('Processing', 'ffmpeg_path', fallback='ffmpeg'),
-        'wifi_wait': config.getint('Advanced', 'wifi_wait', fallback=30),
-        'delete_after_download': config.get('Deletion', 'delete_after_download', fallback='ask').lower()
-    }
-    
-    if not settings['identifier'].strip():
-        settings['identifier'] = None
-        
-    return settings, config
-
-def save_config_updates(config_path: Path, updates: dict[tuple[str, str], str]):
-    """
-    Обновляет файл конфигурации, сохраняя комментарии.
-    `updates` - это словарь, где ключ - кортеж (секция, ключ), а значение - новое значение.
-    """
-    if not updates:
-        return
-
-    try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-
-        current_section = None
-        new_lines = []
-        
-        pending_updates = updates.copy()
-
-        for line in lines:
-            stripped_line = line.strip()
-            if not stripped_line or stripped_line.startswith('#') or stripped_line.startswith(';'):
-                new_lines.append(line)
-                continue
-
-            section_match = re.match(r'\[(.+?)\]', stripped_line)
-            if section_match:
-                current_section = section_match.group(1).strip()
-                new_lines.append(line)
-                continue
-
-            if current_section and '=' in line:
-                key_part = line.split('=', 1)[0].strip()
-                update_key = (current_section, key_part)
-                
-                if update_key in pending_updates:
-                    new_value = pending_updates[update_key]
-                    indent = line[:len(line) - len(line.lstrip())]
-                    new_line = f"{indent}{key_part} = {new_value}\n"
-                    new_lines.append(new_line)
-                    del pending_updates[update_key]
-                else:
-                    new_lines.append(line)
-            else:
-                new_lines.append(line)
-
-        with open(config_path, 'w', encoding='utf-8') as f:
-            f.writelines(new_lines)
-        
-        logging.debug(f"Файл конфигурации '{config_path}' обновлен для ускорения будущих запусков.")
-
-    except (IOError, FileNotFoundError) as e:
-        logging.warning(f"Не удалось обновить файл конфигурации: {e}")
-
-async def input_and_cancel_handler_windows(main_task: asyncio.Task, input_queue: asyncio.Queue) -> None:
-    """
-    В фоновом режиме ожидает нажатия клавиш.
-    - При нажатии Escape отменяет основную задачу.
-    - Другие нажатые клавиши помещает в очередь `input_queue`.
-    """
-    import msvcrt
-    loop = asyncio.get_event_loop()
-    
-    print("\n(Для отмены операции в любой момент нажмите клавишу 'Escape')")
-    
-    while not main_task.done():
-        try:
-            if await loop.run_in_executor(None, msvcrt.kbhit):
-                key = await loop.run_in_executor(None, msvcrt.getch)
-                if key == b'\x1b':  # Код клавиши Escape
-                    if not main_task.done():
-                        logging.warning("\nНажата клавиша Escape. Инициируется отмена операции...")
-                        main_task.cancel()
-                    break
-                else:
-                    # Помещаем в очередь, чтобы другие части программы могли обработать ввод
-                    await input_queue.put(key)
-            
-            await asyncio.sleep(0.1)
-        except asyncio.CancelledError:
-            break
-    logging.debug("Задача-слушатель ввода и отмены завершена.")
-
-async def main() -> None:
-    """Основная логика скрипта."""
-    asyncio.get_event_loop().set_exception_handler(exception_handler)
-    client: BleakClient | None = None
-    wifi_keep_alive_hdl: asyncio.Task | None = None
-    escape_listener_task: asyncio.Task | None = None
-    stop_wifi_keep_alive = asyncio.Event()
-    matched_device: BleakDevice | None = None
-    state = GoProState()
-    original_ssid = None
-    is_windows = platform.system() == "Windows"
-    connected_to_gopro_wifi = False
-    all_downloads_completed = False
-    downloaded_count = 0
-    downloaded_files_meta: list[dict[str, Any]] = []
-    wifi_interface: str | None = None
-    config_updates: dict[tuple[str, str], str] = {}
-    input_queue: asyncio.Queue | None = None
-
-    try:
-        if is_windows:
-            logging.debug("Предотвращение засыпания системы и дисплея на время работы скрипта.")
-            kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
-
-            # Создаем очередь для ввода и запускаем задачу-слушатель
-            input_queue = asyncio.Queue()
-            main_task = asyncio.current_task()
-            escape_listener_task = asyncio.create_task(input_and_cancel_handler_windows(main_task, input_queue))
-
-        config_path = Path("config.ini")
-        config, config_parser = load_config(config_path)
-
-        identifier = config['identifier']
-        output_folder = config['output_folder']
-        home_wifi = config['home_wifi']
-        mode = config['mode']
-        session_gap_hours = config['session_gap_hours']
-        filename_format = config['filename_format']
-        ffmpeg_path = config['ffmpeg_path']
-        wifi_wait = config['wifi_wait']
-        delete_after_download = config['delete_after_download']
-        
-        valid_modes = ['full', 'rename_only', 'download_only', 'touch_only', 'process_only']
-        if mode not in valid_modes:
-            raise ValueError(f"Неверное значение 'mode' в config.ini: {mode}. Допустимые значения: {valid_modes}")
-
-        if mode in ['full', 'rename_only', 'process_only']:
-            script_dir = get_script_dir()
-            ffmpeg_found = is_ffmpeg_available(ffmpeg_path)
-
-            # Если ffmpeg не найден по пути из конфига, ищем его в стандартных местах
-            # 1. В корневой папке скрипта
-            if not ffmpeg_found:
-                local_ffmpeg_path = script_dir / ("ffmpeg.exe" if is_windows else "ffmpeg")
-                if local_ffmpeg_path.exists() and is_ffmpeg_available(str(local_ffmpeg_path)):
-                    logging.debug(f"Найден ffmpeg в корневой папке: '{local_ffmpeg_path}'. Используем его.")
-                    ffmpeg_path = str(local_ffmpeg_path)
-                    ffmpeg_found = True
-
-            # 2. В папке 'bin' рядом со скриптом
-            if not ffmpeg_found:
-                bin_ffmpeg_path = script_dir / "bin" / ("ffmpeg.exe" if is_windows else "ffmpeg")
-                if bin_ffmpeg_path.exists() and is_ffmpeg_available(str(bin_ffmpeg_path)):
-                    logging.debug(f"Найден ffmpeg в папке 'bin': '{bin_ffmpeg_path}'. Используем его.")
-                    ffmpeg_path = str(bin_ffmpeg_path)
-                    ffmpeg_found = True
-
-            # 3. Если ничего не найдено, предлагаем скачать
-            if not ffmpeg_found:
-                if is_windows:
-                    bin_dir = script_dir / "bin"
-                    new_ffmpeg_path = await download_ffmpeg_windows(bin_dir, input_queue)
-                    if new_ffmpeg_path:
-                        ffmpeg_path = new_ffmpeg_path
-                        config_updates[('Processing', 'ffmpeg_path')] = new_ffmpeg_path
-
-        if is_windows:
-            original_ssid = await get_current_wifi_ssid_windows()
-            if original_ssid:
-                logging.debug(f"Текущая сеть Wi-Fi: {original_ssid}")
-            # Автоматически сохраняем домашнюю сеть, если она не задана
-            if not home_wifi and original_ssid and not original_ssid.startswith("GP"):
-                logging.debug(f"Сохранение текущей сети '{original_ssid}' как домашней в config.ini.")
-                home_wifi = original_ssid # Обновляем локальную переменную
-                config_updates[('General', 'home_wifi')] = original_ssid
-            wifi_interface = await get_wifi_interface_windows()
-
-        # 1. Подключение к камере по BLE
-        if mode == 'process_only':
-            logging.info("Режим 'process_only': пропуск этапа подключения и скачивания.")
-            # Устанавливаем флаги, чтобы блок обработки запустился после finally
-            all_downloads_completed = True
-            downloaded_count = 1 # > 0, чтобы запустить обработку
-        else:
-            # Вся логика подключения и скачивания выполняется, если режим НЕ 'process_only'
-            client, matched_device, wifi_creds = await connect_ble(state.notification_handler, identifier) # type: ignore
-            if not client or not matched_device: # Если камера не найдена
-                logging.info("Завершение работы, так как камера не была найдена.")
-                return
-
-            # Автоматически сохраняем идентификатор камеры, если он не был задан
-            if not identifier and matched_device.name:
-                match = re.search(r"([A-Z0-9]{4})$", matched_device.name)
-                if match:
-                    found_identifier = match.group(1)
-                    logging.debug(f"Сохранение идентификатора камеры '{found_identifier}' в config.ini.")
-                    identifier = found_identifier # Обновляем локальную переменную
-                    config_updates[('General', 'identifier')] = found_identifier
-
-            # Если были изменения в конфигурации, сохраняем их, сохраняя комментарии
-            if config_updates:
-                save_config_updates(config_path, config_updates)
-
-            # 2. Включаем Wi-Fi Access Point на камере
-            logging.info("Включаем Wi-Fi Access Point на камере.")
-            client = await control_wifi_ap(client, matched_device, state, enable=True)
-
-            # Отключаемся от BLE, так как он больше не требуется для скачивания по Wi-Fi
-            logging.info("Wi-Fi включен. Завершение сеанса Bluetooth...")
-            if client:
-                await client.disconnect()
-                await asyncio.sleep(1.0) # Пауза для корректного завершения
-            client = None # Указываем, что клиент больше не подключен
-            # Короткая пауза перед началом сканирования, чтобы Wi-Fi успел включиться и стать видимым
-            logging.debug("Ожидание инициализации Wi-Fi на камере (1 секунда)...")
-            await asyncio.sleep(1)
-
-            # 3. Поиск и подключение к Wi-Fi камеры
-            if is_windows:
-                gopro_ssid_from_ble = wifi_creds.get("ssid")
-
-                if gopro_ssid_from_ble:
-                    logging.debug(f"Используем SSID '{gopro_ssid_from_ble}', полученный с камеры по BLE, для прямого подключения.")
-                    # Даем 30 секунд на подключение и получение IP-адреса.
-                    if await switch_wifi_windows(gopro_ssid_from_ble, password=wifi_creds.get("password"), timeout=30, interface=wifi_interface, verify_gopro=True):
-                        connected_to_gopro_wifi = True
-                else:
-                    # Резервный вариант: если не удалось получить SSID по BLE, ищем сеть сканированием.
-                    logging.warning("Не удалось получить SSID с камеры по BLE. Попытка найти сеть сканированием...")
-                    ble_name_identifier = (matched_device.name or "").split(" ")[-1] if matched_device else ""
-                    target_identifier = identifier or ble_name_identifier
-                    
-                    scanned_ssid = await find_wifi_ssid_windows_native(target_identifier, timeout=30)
-                    if scanned_ssid and await switch_wifi_windows(scanned_ssid, password=wifi_creds.get("password"), timeout=30, interface=wifi_interface, verify_gopro=True):
-                        connected_to_gopro_wifi = True
-
-            if not connected_to_gopro_wifi: # Если автоматически не вышло
-                logging.info("=" * 80)
-                logging.info("ДЕЙСТВИЕ: Не удалось подключиться к Wi-Fi автоматически.")
-                logging.info("Пожалуйста, подключитесь к Wi-Fi сети камеры вручную.")
-                logging.info("=" * 80)
-                connection_verified = False
-                loop = asyncio.get_event_loop()
-                while not connection_verified:
-                    print("Нажмите Enter, когда подключитесь, или введите 'x' и Enter для отмены.", end="", flush=True)
-                    # Используем run_in_executor для неблокирующего и безопасного чтения из stdin
-                    user_input = await loop.run_in_executor(None, sys.stdin.readline)
-                    
-                    if user_input.strip().lower() in ['x', 'х']:
-                        logging.info("Отмена пользователем. Завершение работы.")
-                        return
-
-                    logging.info("Проверка соединения с камерой по Wi-Fi...")
-                    try:
-                        async with httpx.AsyncClient(timeout=5.0) as client:
-                            # Используем простой эндпоинт для быстрой проверки
-                            response = await client.get(f"{GOPRO_BASE_URL}/gopro/camera/state", follow_redirects=True)
-                            response.raise_for_status()
-                        logging.info("✅ Соединение с камерой установлено!")
-                        connection_verified = True
-                        connected_to_gopro_wifi = True # Отмечаем для finally блока
-                    except (httpx.RequestError, httpx.HTTPStatusError) as e:
-                        logging.error(f"❌ Не удалось связаться с камерой по адресу {GOPRO_BASE_URL}: {e}")
-                        logging.info("   Убедитесь, что вы подключены к Wi-Fi сети GoPro, и попробуйте снова.")
-
-            # Если мы подключились к Wi-Fi, запускаем Wi-Fi keep-alive
-            if connected_to_gopro_wifi:
-                # Добавляем небольшую паузу, чтобы дать сетевому стеку (особенно в Windows)
-                # полностью стабилизироваться после подключения к Wi-Fi, даже после успешной проверки.
-                # Это помогает избежать ошибок "connection failed" сразу после подключения.
-                logging.debug("Соединение с Wi-Fi установлено. Ожидание стабилизации сети (3 сек)...")
-                await asyncio.sleep(3) # Пауза для стабилизации IP
-
-                wifi_keep_alive_hdl = asyncio.create_task(wifi_keep_alive_task(stop_wifi_keep_alive))
-
-            # 4. Скачивание всех медиафайлов
-            downloaded_count, all_downloads_completed, downloaded_files_meta = await download_files(Path(output_folder))
-            logging.info(f"Процесс скачивания завершен. Скачано новых файлов: {downloaded_count}.")
-            if not all_downloads_completed:
-                logging.warning("Скачивание было прервано. Обработка и удаление файлов будут пропущены.")
-            
-            # 5. Удаление файлов с камеры (если включено)
-            if all_downloads_completed and downloaded_count > 0:
-                should_delete = False
-                if delete_after_download == 'yes':
-                    should_delete = True
-                elif delete_after_download == 'ask':
-                    if is_windows:
-                        should_delete = await get_y_n_with_timeout_windows(
-                            f"Удалить {downloaded_count} скачанных файлов с камеры?",
-                            15,
-                            input_queue
-                        )
-                    else:
-                        # Резервный вариант для не-Windows систем без таймаута
-                        loop = asyncio.get_event_loop()
-                        print(f"\nУдалить {downloaded_count} скачанных файлов с камеры? (y/n): ", end="", flush=True)
-                        user_input = await loop.run_in_executor(None, sys.stdin.readline)
-                        answer = user_input.strip().lower()
-                        if answer in ['y', 'yes', 'д', 'да', 'н']:
-                            should_delete = True
-                        else:
-                            should_delete = False
-                
-                if should_delete:
-                    # Отправляем один пинг перед удалением на всякий случай
-                    logging.debug("Отправка дополнительного keep-alive ping перед началом удаления...")
-                    try:
-                        async with httpx.AsyncClient(timeout=10) as client:
-                            ping_url = f"{GOPRO_BASE_URL}/gopro/camera/keep_alive"
-                            await client.get(ping_url)
-                    except httpx.RequestError as e:
-                        logging.warning(f"Не удалось отправить ping перед удалением (камера могла уснуть): {e}")
-
-                    await delete_files_from_camera(downloaded_files_meta)
-                else:
-                    logging.info("Удаление файлов с камеры пропущено.")
-
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        logging.info("\nОперация прервана пользователем. Запускается процедура очистки...")
-    except Exception as e:
-        logging.error(f"Произошла критическая ошибка в основном процессе: {e}", exc_info=True)
-    finally:
-        # Останавливаем задачу-слушатель Escape в первую очередь
-        if escape_listener_task:
-            logging.debug("Остановка задачи-слушателя Escape...")
-            if not escape_listener_task.done():
-                escape_listener_task.cancel()
-                try:
-                    # Даем ей шанс завершиться чисто
-                    await asyncio.wait_for(escape_listener_task, timeout=1.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError):
-                    pass # Ожидаемое поведение
-
-        logging.debug("Блок finally: начало выполнения.")
-        if is_windows:
-            logging.debug("Возврат настроек энергосбережения системы.")
-            # Сбрасываем флаг, возвращая систему к нормальному управлению питанием
-            kernel32.SetThreadExecutionState(ES_CONTINUOUS)
-
-        if wifi_keep_alive_hdl:
-            logging.debug("Остановка задачи Wi-Fi keep-alive...")
-            stop_wifi_keep_alive.set()
-            try:
-                await asyncio.wait_for(wifi_keep_alive_hdl, timeout=3)
-            except asyncio.TimeoutError:
-                logging.warning("Задача Wi-Fi keep-alive не остановилась вовремя.")
-
-        # 6. Обработка скачанных файлов (после всех операций с камерой)
-        # Этот блок выполняется после скачивания и до возврата на домашний Wi-Fi.
-        if all_downloads_completed and (downloaded_count > 0 or mode == 'process_only'):
-            if mode in ['full', 'rename_only', 'process_only']:
-                process_media(
-                    output_folder=Path(output_folder),
-                    downloaded_files=downloaded_files_meta,
-                    session_gap_hours=session_gap_hours,
-                    ffmpeg_path=ffmpeg_path,
-                    mode=mode,
-                    filename_format=filename_format
-                )
-            elif mode == 'touch_only':
-                touch_files(Path(output_folder), downloaded_files_meta)
-            elif mode == 'download_only':
-                logging.info("Режим 'download_only': обработка файлов пропущена, как и было задано.")
-        # Не выводим сообщение о пропуске, если скачивание было прервано,
-        # т.к. пользователь уже получил сообщение об отмене.
-        elif mode != 'process_only' and downloaded_count == 0 and all_downloads_completed:
-             logging.info("Пропуск обработки медиа (новые файлы не были скачаны).")
-
-        # Логика принудительного выключения камеры удалена по запросу.
-        # Скрипт будет полагаться на автоматическое выключение камеры.
-        if mode != 'process_only':
+        if matched_device and mode != 'process_only':
             logging.info("Процесс завершен. Камера должна выключиться автоматически.")
         else:
             logging.debug("Блок finally: режим process_only, действия с камерой не требуются.")
