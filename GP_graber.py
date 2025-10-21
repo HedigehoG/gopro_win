@@ -641,17 +641,10 @@ def process_media(output_folder: Path, downloaded_files: list[dict[str, Any]], s
             logging.warning(f"Файл '{file_meta['n']}' был в списке скачанных, но не найден на диске. Пропуск.")
             continue
         
-        # Используем 'mod' (время модификации) из API, если оно есть. Это Unix timestamp.
-        timestamp = file_meta.get("mod", 0)
-        if timestamp > 0:
-            # 'mod' от GoPro - это Unix timestamp (UTC). Создаем aware-объект.
-            # Сразу делаем aware-объект.
-            creation_time = datetime.fromtimestamp(timestamp, timezone.utc).replace(tzinfo=timezone.utc)
-        else:
-            # Если в API нет времени, используем медленный, но надежный ffprobe
-            if 'mod' in file_meta: # Выводим предупреждение, только если 'mod' был, но оказался некорректным.
-                logging.warning(f"Для файла '{file_meta['n']}' не найдена дата в API, используется fallback (ffprobe).")
-            creation_time = get_video_creation_time(file_path, ffmpeg_path)
+        # Временная метка 'mod' из API GoPro ведет себя непредсказуемо в разных режимах.
+        # Чтобы гарантировать корректное время, всегда используем ffprobe для его получения.
+        # Это может быть немного медленнее, но значительно надежнее.
+        creation_time = get_video_creation_time(file_path, ffmpeg_path)
         
         if creation_time:
             # Конвертируем в локальное время для корректного именования
