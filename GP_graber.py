@@ -122,10 +122,10 @@ GoPro Graber - Автоматический загрузчик медиа с к�
 
   [General]
   - identifier:      Последние 4 символа серийного номера GoPro (часть имени сети).
-                     Оставьте пустым для автоматического определения.
+                     Закомментируйте эту строку (поставьте # в начале) для автоматического определения.
   - output_folder:   Папка для сохранения медиа.
   - home_wifi:       Имя домашней Wi-Fi сети для возврата ПК после скачивания.
-                     Оставьте пустым, если не хотите автоматически переключаться.
+                     Закомментируйте эту строку (поставьте # в начале), если не хотите автоматически переключаться.
 
   [Processing]
   - mode:            Режим обработки файлов после скачивания:
@@ -144,6 +144,9 @@ GoPro Graber - Автоматический загрузчик медиа с к�
 
   [Deletion]
   - delete_after_download: Удалять ли файлы с камеры после скачивания (yes/ask/no).
+
+  [Power]
+  - shutdown_after_complete: Выключать ли камеру после завершения (yes/no).
 """
 
 HELP_EN = """
@@ -167,10 +170,10 @@ Settings (config.ini):
 
   [General]
   - identifier:      The last 4 characters of the GoPro serial number (part of the network name).
-                     Leave empty for automatic detection.
+                     Comment out this line (add # at the beginning) for automatic detection.
   - output_folder:   The folder where media will be saved.
   - home_wifi:       The name of your home Wi-Fi network to switch back to after downloading.
-                     Leave empty to disable automatic switching.
+                     Comment out this line (add # at the beginning) to disable automatic switching.
 
   [Processing]
   - mode:            File processing mode after download:
@@ -189,6 +192,9 @@ Settings (config.ini):
 
   [Deletion]
   - delete_after_download: Whether to delete files from the camera after downloading (yes/ask/no).
+
+  [Power]
+  - shutdown_after_complete: Whether to turn off the camera after completion (yes/no).
 """
 
 def show_help():
@@ -378,7 +384,7 @@ async def ensure_client_connected(client: BleakClient | None, matched_device: Bl
     if client and getattr(client, "is_connected", False):
         return client
 
-    logging.info("Переподключение к устройству по BLE...")
+    logging.debug("Переподключение к устройству по BLE...")
     new_client = BleakClient(matched_device)
     try:
         await new_client.connect(timeout=15)
@@ -386,7 +392,7 @@ async def ensure_client_connected(client: BleakClient | None, matched_device: Bl
         await asyncio.sleep(0.2) # Небольшая пауза после подключения
         await new_client.start_notify(OG_COMMAND_RESPONSE_UUID, notification_handler)
         await new_client.start_notify(OG_SETTINGS_RESPONSE_UUID, notification_handler)
-        logging.info("Переподключение по BLE выполнено.")
+        logging.debug("Переподключение по BLE выполнено.")
         return new_client
     except Exception as e:
         logging.error(f"Не удалось переподключиться по BLE: {e}")
@@ -415,6 +421,29 @@ async def control_wifi_ap(client: BleakClient, matched_device: BleakDevice, stat
             raise RuntimeError(f"Ошибка при установке состояния Wi-Fi AP. Статус: {status}")
     except asyncio.TimeoutError:
         raise RuntimeError("Тайм-аут ожидания ответа на команду Wi-Fi AP.")
+    return client
+
+async def sleep_camera(client: BleakClient | None, matched_device: BleakDevice, state: GoProState) -> BleakClient:
+    """Отправляет команду на выключение камеры."""
+    logging.info("Отправка команды на выключение камеры...")
+    future = asyncio.Future()
+    state.command_status[GoProState.COMMAND_ID_SLEEP] = future
+    try:
+        # Убедимся, что клиент подключен и, при необходимости, переподключимся
+        client = await ensure_client_connected(client, matched_device, state.notification_handler)
+        await client.write_gatt_char(OG_COMMAND_REQUEST_UUID, OG_SLEEP)
+    except BleakError as e:
+        logging.warning(f"BLE write failed: {e}. Попытка переподключения и повторной отправки...")
+        client = await ensure_client_connected(None, matched_device, state.notification_handler)
+        await client.write_gatt_char(OG_COMMAND_REQUEST_UUID, OG_SLEEP)
+    try:
+        status = await asyncio.wait_for(future, timeout=10)
+        if status == 0:
+            logging.debug("Команда на выключение успешно отправлена.")
+        else:
+            logging.error(f"Ошибка при отправке команды на выключение. Статус: {status}")
+    except asyncio.TimeoutError:
+        logging.error("Тайм-аут ожидания ответа на команду выключения.")
     return client
 
 async def download_files(output_path: Path) -> tuple[int, bool, list[dict[str, Any]], list[dict[str, Any]]]:
@@ -547,7 +576,7 @@ async def delete_files_from_camera(files_to_delete: list[dict[str, Any]]):
             for file_info in files_to_delete:
                 directory, filename = file_info["d"], file_info["n"]
                 # URL согласно спецификации OpenGoPro
-                delete_url = f"{GOPRO_BASE_URL}:{GOPRO_MEDIA_PORT}/gopro/media/delete/file?path={directory}/{filename}"
+                delete_url = f"{GOPRO_BASE_URL}/gopro/media/delete/file?path={directory}/{filename}"
                 
                 pbar.set_description_str(f"Удаление {filename}")
                 try:
@@ -618,7 +647,7 @@ def process_media(output_folder: Path, downloaded_files: list[dict[str, Any]], s
 
     # --- Новая логика: всегда сканируем папку на наличие ВСЕХ необработанных файлов ---
     # Это решает проблему, когда скачивание было прервано и возобновлено.
-    logging.info("Сканирование папки на наличие необработанных файлов...")
+    logging.debug("Сканирование папки на наличие необработанных файлов...")
     raw_files_on_disk = [f for f in output_folder.glob("*.MP4") if re.match(r"G[HX]\d{2}\d{4}\.MP4", f.name, re.IGNORECASE)]
     
     if not raw_files_on_disk:
@@ -666,7 +695,7 @@ def process_media(output_folder: Path, downloaded_files: list[dict[str, Any]], s
         logging.info("Режим 'rename_only': переименование каждого файла индивидуально.")
         for file_path, creation_time in files_sorted:
             # Добавляем часть оригинального имени, чтобы избежать коллизий
-            sequence_match = re.search(r"G[HX](\d{2})(\d{4})", file_path.stem, re.IGNORECASE)
+            sequence_match = re.search(r"G[HX](\\d{2})(\\d{4})", file_path.stem, re.IGNORECASE)
             sequence_str = f"_{sequence_match.group(1)}{sequence_match.group(2)}" if sequence_match else ""
             
             # Для уникальности в режиме rename_only добавляем секунды и оригинальный номер к формату из конфига
@@ -738,7 +767,7 @@ def process_media(output_folder: Path, downloaded_files: list[dict[str, Any]], s
             try:
                 with open(concat_list_path, "w", encoding="utf-8") as f:
                     for file_path in session_files:
-                        f.write(f"file '{file_path.resolve()}'\n")
+                        f.write(f"file '{file_path.resolve()}\n")
                 
                 cmd = [ffmpeg_path, "-f", "concat", "-safe", "0", "-i", str(concat_list_path), "-c", "copy", "-y", str(out_path)]
                 res = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -1160,10 +1189,8 @@ if is_windows:
                     logging.error(f"Ошибка при управлении профилем Wi-Fi через WinAPI: {e}")
                     return False
                 finally:
-                    if pIfList:
-                        wlanapi.WlanFreeMemory(pIfList)
-                    if hClient:
-                        wlanapi.WlanCloseHandle(hClient, None)
+                    if pIfList: wlanapi.WlanFreeMemory(pIfList)
+                    if hClient: wlanapi.WlanCloseHandle(hClient, None)
 
             else: # Для домашней сети
                 profile_exists = False
@@ -1351,15 +1378,15 @@ async def download_ffmpeg_windows(target_dir: Path, input_queue: asyncio.Queue) 
 
 DEFAULT_CONFIG = r"""[General]
 # Identifier: последние 4 символа серийного номера GoPro (часть имени сети).
-# Оставьте пустым для автоматического определения.
-identifier = 
+# Закомментируйте эту строку (поставьте # в начале) для автоматического определения.
+#identifier = 
 
 # OutputFolder: папка для сохранения медиа.
 output_folder = GoPro_Media
 
 # HomeWifi: имя домашней Wi-Fi сети для возврата ПК после скачивания.
-# Оставьте пустым, если не хотите автоматически переключаться обратно.
-home_wifi = 
+# Закомментируйте эту строку (поставьте # в начале), если не хотите автоматически переключаться обратно.
+#home_wifi = 
 
 [Processing]
 # Mode: режим обработки файлов после скачивания.
@@ -1402,6 +1429,12 @@ media_port = 8080
 # ask: Спрашивать каждый раз (по умолчанию).
 # yes: Всегда удалять без запроса.
 delete_after_download = ask
+
+[Power]
+# ShutdownAfterComplete: выключать ли камеру после завершения всех операций.
+# yes: Выключать.
+# no:  Оставить включенной (она выключится сама по таймеру).
+shutdown_after_complete = yes
 """
 
 def load_config(config_path: Path) -> tuple[dict[str, Any], configparser.ConfigParser]:
@@ -1430,7 +1463,8 @@ def load_config(config_path: Path) -> tuple[dict[str, Any], configparser.ConfigP
         'wifi_wait': config.getint('Advanced', 'wifi_wait', fallback=30),
         'media_port': config.get('Advanced', 'media_port', fallback='8080'),
         'auto_close_window': config.get('Advanced', 'auto_close_window', fallback='no').lower(),
-        'delete_after_download': config.get('Deletion', 'delete_after_download', fallback='ask').lower()
+        'delete_after_download': config.get('Deletion', 'delete_after_download', fallback='ask').lower(),
+        'shutdown_after_complete': config.get('Power', 'shutdown_after_complete', fallback='yes').lower()
     }
     
     # Обновляем глобальные переменные на основе конфига
@@ -1575,8 +1609,8 @@ async def main() -> None:
         filename_format = config['filename_format']
         ffmpeg_path = config['ffmpeg_path']
         wifi_wait = config['wifi_wait']
-        # media_port уже обработан в load_config
         delete_after_download = config['delete_after_download']
+        shutdown_after_complete = config['shutdown_after_complete']
         
         valid_modes = ['full', 'rename_only', 'download_only', 'touch_only', 'process_only']
         if mode not in valid_modes:
@@ -1682,10 +1716,10 @@ async def main() -> None:
                         connected_to_gopro_wifi = True
 
             if not connected_to_gopro_wifi: # Если автоматически не вышло
-                logging.info("=" * 80)
+                logging.info("="*80)
                 logging.info("ДЕЙСТВИЕ: Не удалось подключиться к Wi-Fi автоматически.")
                 logging.info("Пожалуйста, подключитесь к Wi-Fi сети камеры вручную.")
-                logging.info("=" * 80)
+                logging.info("="*80)
                 connection_verified = False
                 loop = asyncio.get_event_loop()
                 while not connection_verified:
@@ -1779,6 +1813,17 @@ async def main() -> None:
                 else:
                     logging.info("Удаление файлов с камеры пропущено.")
 
+            # 6. Выключение камеры (если включено)
+            if shutdown_after_complete == 'yes' and matched_device and mode != 'process_only':
+                try:
+                    # Нам нужен новый клиент, т.к. старый был отключен
+                    client = await sleep_camera(None, matched_device, state)
+                    if client and client.is_connected:
+                        await client.disconnect()
+                        client = None # Убедимся, что он None для finally блока
+                except Exception as e:
+                    logging.warning(f"Не удалось корректно выключить камеру: {e}")
+
     except (KeyboardInterrupt, asyncio.CancelledError):
         logging.info("\nОперация прервана пользователем. Запускается процедура очистки...")
     except Exception as e:
@@ -1817,7 +1862,7 @@ async def main() -> None:
             except asyncio.TimeoutError:
                 logging.warning("Задача Wi-Fi keep-alive не остановилась вовремя.")
 
-        # 6. Обработка скачанных файлов (после всех операций с камерой)
+        # 7. Обработка скачанных файлов (после всех операций с камерой)
         # Этот блок выполняется после скачивания и до возврата на домашний Wi-Fi.
         if all_downloads_completed and (downloaded_count > 0 or mode == 'process_only'):
             if mode in ['full', 'rename_only', 'process_only']:
@@ -1833,17 +1878,10 @@ async def main() -> None:
                 touch_files(Path(output_folder), downloaded_files_meta)
             elif mode == 'download_only':
                 logging.info("Режим 'download_only': обработка файлов пропущена, как и было задано.")
-        # Не выводим сообщение о пропуске, если скачивание было прервано,
+        # Не выводим сообщение о пропуске, если скачивание было прервано, 
         # т.к. пользователь уже получил сообщение об отмене.
         elif mode != 'process_only' and downloaded_count == 0 and all_downloads_completed:
              logging.info("Пропуск обработки медиа (новые файлы не были скачаны).")
-
-        # Логика принудительного выключения камеры удалена по запросу.
-        # Скрипт будет полагаться на автоматическое выключение камеры.
-        if matched_device and mode != 'process_only':
-            logging.info("Процесс завершен. Камера должна выключиться автоматически.")
-        else:
-            logging.debug("Блок finally: режим process_only, действия с камерой не требуются.")
 
         # Возвращаемся на домашний Wi-Fi
         if is_windows and connected_to_gopro_wifi:
@@ -1857,8 +1895,6 @@ async def main() -> None:
             logging.debug("Блок finally: Возврат к исходной сети Wi-Fi не требуется (переключения не было или не Windows).")
 
         logging.debug("Блок finally: завершение.")
-
-    logging.info("✅ Готово!")
 
 
 if __name__ == "__main__":
