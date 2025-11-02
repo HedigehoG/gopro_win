@@ -534,7 +534,7 @@ async def download_files(output_path: Path) -> tuple[int, bool, list[dict[str, A
                                         m, s = divmod(remaining_time_sec, 60)
                                         h, m = divmod(m, 60)
                                         
-                                        remaining_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}" if h > 0 else f"{int(m):02d}:{int(s):02d}"
+                                        remaining_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}" if h > 0 else f"  :{int(m):02d}:{int(s):02d}"
                                         pbar.set_postfix_str(f"общее {remaining_str}", refresh=False)
                 
                 total_downloaded_size += file_size # Добавляем размер файла к общему скачанному объему
@@ -629,7 +629,7 @@ def get_video_creation_time(file_path: Path, ffmpeg_path: str) -> datetime | Non
     # Возвращаем время модификации файла как aware-объект в UTC
     return datetime.fromtimestamp(file_path.stat().st_mtime, timezone.utc)
 
-def process_media(output_folder: Path, downloaded_files: list[dict[str, Any]], session_gap_hours: int = 2, ffmpeg_path: str = "ffmpeg", mode: str = "full", filename_format: str = "%y_%m_%d_%H-%M"):
+async def process_media(output_folder: Path, downloaded_files: list[dict[str, Any]], session_gap_hours: int = 2, ffmpeg_path: str = "ffmpeg", mode: str = "full", filename_format: str = "%y_%m_%d_%H-%M"):
     """Группирует, переименовывает и склеивает/обрабатывает скачанные видео."""
     logging.info("Обработка скачанных медиафайлов...")
     try:
@@ -764,24 +764,61 @@ def process_media(output_folder: Path, downloaded_files: list[dict[str, Any]], s
         else:
             logging.info(f"Склейка {len(session_files)} файлов в '{out_name}'...")
             concat_list_path = output_folder / "concat.txt"
+            proc = None
             try:
                 with open(concat_list_path, "w", encoding="utf-8") as f:
                     for file_path in session_files:
                         f.write(f"file '{file_path.resolve()}\n")
-                
+
                 cmd = [ffmpeg_path, "-f", "concat", "-safe", "0", "-i", str(concat_list_path), "-c", "copy", "-y", str(out_path)]
-                res = subprocess.run(cmd, capture_output=True, text=True, check=True)
                 
+                # Используем asyncio.create_subprocess_exec для неблокирующего вызова
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    startupinfo=_get_subprocess_startupinfo() # Скрываем окно консоли в Windows
+                )
+                
+                # Ожидаем завершения процесса, это позволяет event loop работать
+                stdout, stderr = await proc.communicate()
+
+                if proc.returncode != 0:
+                    # Если ffmpeg вернул ошибку, вызываем исключение
+                    raise subprocess.CalledProcessError(
+                        proc.returncode, cmd, 
+                        output=stdout.decode('utf-8', errors='ignore') if stdout else '', 
+                        stderr=stderr.decode('utf-8', errors='ignore') if stderr else ''
+                    )
+
                 logging.info("Склейка успешна. Удаление исходных файлов...")
                 for file_path in session_files:
                     try:
                         file_path.unlink()
                     except OSError as e:
                         logging.error(f"Не удалось удалить исходный файл '{file_path.name}': {e}")
+
+            except asyncio.CancelledError:
+                logging.warning("\nОперация склейки отменена пользователем.")
+                if proc and proc.returncode is None:
+                    logging.info("Остановка процесса ffmpeg...")
+                    try:
+                        proc.terminate()
+                        await proc.wait()
+                        logging.info("Процесс ffmpeg остановлен.")
+                    except Exception as kill_e:
+                        logging.error(f"Не удалось остановить процесс ffmpeg: {kill_e}")
+                # Перевызываем исключение, чтобы основной цикл мог его обработать
+                raise
+
             except (Exception, subprocess.CalledProcessError) as e:
-                logging.error(f"Ошибка при склейке: {e}\n{getattr(e, 'stderr', '')}")
+                # Логируем stderr, если он есть
+                err_output = getattr(e, 'stderr', '')
+                logging.error(f"Ошибка при склейке: {e}\n{err_output}")
+
             finally:
-                if concat_list_path.exists(): concat_list_path.unlink()
+                if concat_list_path.exists():
+                    concat_list_path.unlink()
 
 def touch_files(output_folder: Path, downloaded_files: list[dict[str, Any]]):
     """Устанавливает дату модификации файлов равной дате съемки из API."""
@@ -1866,7 +1903,7 @@ async def main() -> None:
         # Этот блок выполняется после скачивания и до возврата на домашний Wi-Fi.
         if all_downloads_completed and (downloaded_count > 0 or mode == 'process_only'):
             if mode in ['full', 'rename_only', 'process_only']:
-                process_media(
+                await process_media(
                     output_folder=Path(output_folder),
                     downloaded_files=downloaded_files_meta,
                     session_gap_hours=session_gap_hours,
