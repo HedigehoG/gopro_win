@@ -508,7 +508,8 @@ async def download_files(output_path: Path) -> tuple[int, bool, list[dict[str, A
                     r.raise_for_status()
                     total_size_from_header = int(r.headers.get("Content-Length", file_size))
                     with open(local_path, "wb") as f, tqdm(
-                        total=total_size_from_header, unit='B', unit_scale=True, desc=filename, ncols=100
+                        total=total_size_from_header, unit='B', unit_scale=True, desc=filename, ncols=100,
+                        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
                     ) as pbar:
                         last_postfix_update_time = 0
                         downloaded_in_file = 0
@@ -534,7 +535,7 @@ async def download_files(output_path: Path) -> tuple[int, bool, list[dict[str, A
                                         m, s = divmod(remaining_time_sec, 60)
                                         h, m = divmod(m, 60)
                                         
-                                        remaining_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}" if h > 0 else f"  :{int(m):02d}:{int(s):02d}"
+                                        remaining_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
                                         pbar.set_postfix_str(f"общее {remaining_str}", refresh=False)
                 
                 total_downloaded_size += file_size # Добавляем размер файла к общему скачанному объему
@@ -673,19 +674,18 @@ async def process_media(output_folder: Path, downloaded_files: list[dict[str, An
         # Временная метка 'mod' из API GoPro ведет себя непредсказуемо в разных режимах.
         # Чтобы гарантировать корректное время, всегда используем ffprobe для его получения.
         # Это может быть немного медленнее, но значительно надежнее.
-        creation_time = get_video_creation_time(file_path, ffmpeg_path)
+        utc_creation_time = get_video_creation_time(file_path, ffmpeg_path) # type: ignore
         
-        if creation_time:
+        if utc_creation_time:
             # Конвертируем в локальное время для корректного именования
-            local_creation_time = creation_time.astimezone()
+            local_creation_time = utc_creation_time.astimezone() # type: ignore
             file_datetimes.append((file_path, local_creation_time))
             # Если режим process_only, то mode будет 'full' по умолчанию
             if mode == 'process_only':
                 mode = 'full'
-
         else:
             # Если время получить не удалось ни из API, ни из ffprobe, пропускаем файл,
-            # чтобы избежать неверного переименования/склейки.
+            # чтобы избежать неверного переименования/склейки. get_video_creation_time уже выводит лог.
             logging.warning(f"Не удалось определить время съемки для '{file_path.name}'. Файл будет пропущен при обработке.")
 
     # Сортируем файлы по дате съемки
@@ -724,7 +724,7 @@ async def process_media(output_folder: Path, downloaded_files: list[dict[str, An
     if files_sorted:
         current_session.append(files_sorted[0])
         for i in range(1, len(files_sorted)):
-            gap = timedelta(hours=session_gap_hours)
+            gap = timedelta(hours=session_gap_hours) # type: ignore
             _prev_path, prev_dt = files_sorted[i-1]
             _curr_path, curr_dt = files_sorted[i]
             
@@ -737,13 +737,15 @@ async def process_media(output_folder: Path, downloaded_files: list[dict[str, An
     for session in sessions:
         if not session: continue
         
-        # Сортируем файлы внутри сессии по имени, чтобы главы шли по порядку
-        session.sort(key=lambda item: item[0].name)
+        # Сортируем файлы внутри сессии: сначала по времени, потом по имени файла.
+        # Это гарантирует, что главы (GH01, GH02) одного видео будут идти в правильном порядке,
+        # даже если их время создания, по данным ffprobe, совпадает до секунды.
+        session.sort(key=lambda item: (item[1], item[0].name)) # type: ignore
         
-        session_files = [item[0] for item in session]
-        _first_file_path, first_file_dt = session[0]
+        session_files = [item[0] for item in session] # type: ignore
+        _first_file_path, first_file_dt = session[0] # type: ignore
         
-        base_name = first_file_dt.strftime(filename_format)
+        base_name = first_file_dt.strftime(filename_format) # type: ignore
         out_name = f"{base_name}.mp4"
         out_path = output_folder / out_name
 
@@ -819,22 +821,32 @@ async def process_media(output_folder: Path, downloaded_files: list[dict[str, An
             finally:
                 if concat_list_path.exists():
                     concat_list_path.unlink()
-
-def touch_files(output_folder: Path, downloaded_files: list[dict[str, Any]]):
-    """Устанавливает дату модификации файлов равной дате съемки из API."""
+ 
+def touch_files(output_folder: Path, downloaded_files: list[dict[str, Any]], ffmpeg_path: str): # type: ignore
+    """Устанавливает дату модификации файлов равной дате съемки, полученной через ffprobe."""
     logging.info("Режим 'touch_only': обновление временных меток файлов...")
     
     touched_count = 0
-    for file_meta in tqdm(downloaded_files, desc="Обновление дат", ncols=100):
+    for file_meta in tqdm(downloaded_files, desc="Обновление дат", ncols=100): # type: ignore
         file_path = output_folder / file_meta["n"]
-        timestamp = file_meta.get("mod")
-        
-        if timestamp and timestamp > 0 and file_path.exists():
+        if not file_path.exists():
+            continue
+
+        # Получаем точное время съемки из метаданных видео
+        utc_creation_time = get_video_creation_time(file_path, ffmpeg_path) # type: ignore
+
+        if utc_creation_time:
+            # os.utime ожидает Unix timestamp.
+            # Важно использовать UTC timestamp, чтобы избежать проблем с часовыми поясами.
+            timestamp = utc_creation_time.timestamp() # type: ignore
             try:
                 os.utime(file_path, (timestamp, timestamp))
                 touched_count += 1
             except Exception as e:
                 logging.warning(f"Не удалось обновить дату для '{file_path.name}': {e}")
+        else:
+            logging.warning(f"Не удалось получить время съемки для '{file_path.name}', временная метка не будет обновлена.")
+
     logging.info(f"Обновлены временные метки для {touched_count} файлов.")
 
 async def wifi_keep_alive_task(stop_event: asyncio.Event) -> None:
@@ -1190,46 +1202,42 @@ if is_windows:
             if password:
                 logging.debug(f"Обновление профиля Wi-Fi для '{ssid}'...")
                 profile_xml = create_wifi_profile_xml(ssid, password)
-                
                 hClient = wintypes.HANDLE()
                 pIfList = ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)()
-                try: #
+                try:
                     if wlanapi.WlanOpenHandle(2, None, ctypes.byref(wintypes.DWORD()), ctypes.byref(hClient)) != 0:
                         raise RuntimeError("WlanOpenHandle failed for profile management.")
                     if wlanapi.WlanEnumInterfaces(hClient, None, ctypes.byref(pIfList)) != 0:
                         raise RuntimeError("WlanEnumInterfaces failed for profile management.")
                     iface_list = pIfList.contents
                     if iface_list.dwNumberOfItems == 0:
-                        logging.warning("Wi-Fi интерфейс не найден для управления профилем.")
                         return False
                     iface_guid_bytes = iface_list.InterfaceInfo[0].InterfaceGuid
                     iface_guid = ctypes.cast(ctypes.byref(iface_guid_bytes), ctypes.POINTER(ctypes.c_byte * 16))
-
-                    # Удаляем старый профиль, если он существует, чтобы избежать конфликтов
-                    wlanapi.WlanDeleteProfile(hClient, iface_guid, ssid, None)
-
+                    
                     # Пытаемся установить профиль для текущего пользователя (не требует прав администратора)
-                    dwFlags_user = 0  # WLAN_PROFILE_USER
+                    dwFlags = 0  # WLAN_PROFILE_USER
                     pdwReasonCode = wintypes.DWORD()
-                    ret = wlanapi.WlanSetProfile(hClient, iface_guid, dwFlags_user, profile_xml, None, True, None, ctypes.byref(pdwReasonCode))
-
-                    if ret != 0:
-                        logging.warning(f"Не удалось создать профиль для текущего пользователя (код {ret}). Пробуем создать для всех пользователей (может требовать прав администратора)...")
-                        # Резервный вариант: пытаемся установить профиль для всех пользователей
-                        dwFlags_all_users = 0x4  # WLAN_PROFILE_GROUP_POLICY
-                        ret = wlanapi.WlanSetProfile(hClient, iface_guid, dwFlags_all_users, profile_xml, None, True, None, ctypes.byref(pdwReasonCode))
-                        if ret != 0: # Если и это не удалось, просто возвращаем False без лога ошибки
+                    ret = wlanapi.WlanSetProfile(hClient, iface_guid, dwFlags, profile_xml, None, True, None, ctypes.byref(pdwReasonCode))
+                    
+                    if ret == 0:
+                        logging.debug(f"Профиль Wi-Fi для '{ssid}' успешно создан/обновлен.")
+                    else:
+                        # ERROR_ACCESS_DENIED (5) может возникнуть, если профиль уже существует как "all-user profile".
+                        # В этом случае мы не можем его изменить без прав администратора.
+                        # Вместо того чтобы запрашивать права, мы просто продолжим, полагаясь на существующий профиль.
+                        if ctypes.get_last_error() == 5:
+                             logging.debug(f"Не удалось обновить профиль '{ssid}' (возможно, он создан для всех пользователей). Используем существующий.")
+                        else:
+                            logging.error(f"Ошибка при создании профиля Wi-Fi '{ssid}' через WinAPI: код {ret}, причина {pdwReasonCode.value}")
                             return False
-
-                    logging.debug(f"Профиль Wi-Fi для '{ssid}' успешно создан/обновлен.")
                 except Exception as e:
                     logging.error(f"Ошибка при управлении профилем Wi-Fi через WinAPI: {e}")
                     return False
                 finally:
                     if pIfList: wlanapi.WlanFreeMemory(pIfList)
                     if hClient: wlanapi.WlanCloseHandle(hClient, None)
-
-            else: # Для домашней сети
+            elif not verify_gopro: # Для домашней сети, пароль не передается
                 profile_exists = False
                 startupinfo = _get_subprocess_startupinfo()
                 check_profile_cmd = ["netsh", "wlan", "show", "profile", f"name={ssid}"]
@@ -1247,7 +1255,7 @@ if is_windows:
                     return False
             
             # --- Подключение ---
-            log_func = logging.info if verify_gopro else logging.debug
+            log_func = logging.info if verify_gopro else logging.info
             log_func(f"Подключаемся к Wi-Fi '{ssid}'...")
             if await _connection_loop(ssid, timeout):
                 return True
@@ -1455,6 +1463,12 @@ wifi_wait = 30
 # no:  Ожидать нажатия Enter перед закрытием (по умолчанию).
 auto_close_window = no
 
+# WifiPowerOnDelay: секунд ожидания ПОСЛЕ отправки команды на включение Wi-Fi на камере.
+# Эта пауза дает камере время для полной инициализации 5 ГГц сети, что может
+# значительно увеличить скорость скачивания. Рекомендуемое значение: 3-5 секунд.
+# Если скорость скачивания низкая (~10-12 МБ/с), попробуйте увеличить это значение.
+wifi_power_on_delay = 3
+
 # MediaPort: порт для скачивания медиафайлов.
 # Для старых камер (до HERO9) используйте 8080.
 # Для новых камер (HERO9 и новее) можно оставить пустым для использования стандартного порта 80.
@@ -1473,6 +1487,12 @@ delete_after_download = ask
 # no:  Оставить включенной (она выключится сама по таймеру).
 shutdown_after_complete = yes
 """
+
+def sanitize_filename_format(format_str: str) -> str:
+    """Заменяет недопустимые для имен файлов символы на '_'."""
+    # Windows invalid chars: < > : " / \ | ? *
+    # Дополнительно заменяем пробелы для удобства
+    return re.sub(r'[<>:"/\\|?* ]', '_', format_str)
 
 def load_config(config_path: Path) -> tuple[dict[str, Any], configparser.ConfigParser]:
     """Загружает конфигурацию из config.ini. Если файл не существует, создает его с настройками по умолчанию."""
@@ -1495,10 +1515,11 @@ def load_config(config_path: Path) -> tuple[dict[str, Any], configparser.ConfigP
         'home_wifi': config.get('General', 'home_wifi', fallback=''),
         'mode': config.get('Processing', 'mode', fallback='full').lower(),
         'session_gap_hours': config.getint('Processing', 'session_gap_hours', fallback=2),
-        'filename_format': config.get('Processing', 'filename_format', fallback='(%Y-%m-%d_%H_%M)'),
+        'filename_format': sanitize_filename_format(config.get('Processing', 'filename_format', fallback='%Y-%m-%d_%H_%M')),
         'ffmpeg_path': config.get('Processing', 'ffmpeg_path', fallback='ffmpeg'),
         'wifi_wait': config.getint('Advanced', 'wifi_wait', fallback=30),
         'media_port': config.get('Advanced', 'media_port', fallback='8080'),
+        'wifi_power_on_delay': config.getint('Advanced', 'wifi_power_on_delay', fallback=3),
         'auto_close_window': config.get('Advanced', 'auto_close_window', fallback='no').lower(),
         'delete_after_download': config.get('Deletion', 'delete_after_download', fallback='ask').lower(),
         'shutdown_after_complete': config.get('Power', 'shutdown_after_complete', fallback='yes').lower()
@@ -1646,6 +1667,7 @@ async def main() -> None:
         filename_format = config['filename_format']
         ffmpeg_path = config['ffmpeg_path']
         wifi_wait = config['wifi_wait']
+        wifi_power_on_delay = config['wifi_power_on_delay']
         delete_after_download = config['delete_after_download']
         shutdown_after_complete = config['shutdown_after_complete']
         
@@ -1724,15 +1746,16 @@ async def main() -> None:
             logging.info("Включаем Wi-Fi Access Point на камере.")
             client = await control_wifi_ap(client, matched_device, state, enable=True)
 
+            # Даем камере время на полную инициализацию Wi-Fi, особенно 5 ГГц диапазона.
+            if wifi_power_on_delay > 0:
+                logging.info(f"Ожидание {wifi_power_on_delay} сек. для стабилизации Wi-Fi на камере...")
+                await asyncio.sleep(wifi_power_on_delay)
+
             # Отключаемся от BLE, так как он больше не требуется для скачивания по Wi-Fi
             logging.info("Wi-Fi включен. Завершение сеанса Bluetooth...")
             if client:
                 await client.disconnect()
                 await asyncio.sleep(1.0) # Пауза для корректного завершения
-            client = None # Указываем, что клиент больше не подключен
-            # Короткая пауза перед началом сканирования, чтобы Wi-Fi успел включиться и стать видимым
-            logging.debug("Ожидание инициализации Wi-Fi на камере (1 секунда)...")
-            await asyncio.sleep(1)
 
             # 3. Поиск и подключение к Wi-Fi камеры
             if is_windows:
@@ -1803,6 +1826,7 @@ async def main() -> None:
                 logging.warning("Скачивание было прервано. Обработка и удаление файлов будут пропущены.")
             
             # 5. Удаление файлов с камеры (если включено)
+            files_on_disk_and_camera: list[dict[str, Any]] = []
             if all_downloads_completed and all_files_on_camera_meta:
                 # Определяем, какие из файлов на камере уже есть на диске
                 files_on_disk_and_camera = [
@@ -1812,49 +1836,38 @@ async def main() -> None:
                 if not files_on_disk_and_camera:
                     # Это может произойти, если скачивание было прервано и ни один файл не скачался полностью
                     logging.debug("Нет полностью скачанных файлов для удаления.")
-                    should_delete = False # Already False, but explicit for clarity
-                else:
+            
+                else: # Если файлы для удаления есть
                     should_delete = False
-                should_delete = False
-                if delete_after_download == 'yes':
-                    should_delete = True
-                elif delete_after_download == 'ask':
-                    if is_windows:
-                        should_delete = await get_y_n_with_timeout_windows(
-                            f"Удалить {len(files_on_disk_and_camera)} файлов, уже имеющихся на диске, с камеры?",
-                            15,
-                            input_queue
-                        )
+                    if delete_after_download == 'yes':
+                        should_delete = True
+                    elif delete_after_download == 'ask':
+                        if is_windows and input_queue:
+                            should_delete = await get_y_n_with_timeout_windows(
+                                f"Удалить {len(files_on_disk_and_camera)} файлов, уже имеющихся на диске, с камеры?", 15, input_queue # type: ignore
+                            )
+                        else: # Резервный вариант для не-Windows систем или если очередь не создана
+                            print(f"\nУдалить {len(files_on_disk_and_camera)} файлов, уже имеющихся на диске, с камеры? (y/n): ", end="", flush=True)
+                            user_input = await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
+                            should_delete = user_input.strip().lower() in ['y', 'yes', 'д', 'да']
+                    
+                    if should_delete:
+                        # Отправляем один пинг перед удалением на всякий случай
+                        logging.debug("Отправка дополнительного keep-alive ping перед началом удаления...")
+                        try:
+                            async with httpx.AsyncClient(timeout=10) as client:
+                                await client.get(f"{GOPRO_BASE_URL}/gopro/camera/keep_alive")
+                        except httpx.RequestError as e:
+                            logging.warning(f"Не удалось отправить ping перед удалением (камера могла уснуть): {e}")
+                        await delete_files_from_camera(files_on_disk_and_camera)
                     else:
-                        # Резервный вариант для не-Windows систем без таймаута
-                        loop = asyncio.get_event_loop()
-                        print(f"\nУдалить {len(files_on_disk_and_camera)} файлов, уже имеющихся на диске, с камеры? (y/n): ", end="", flush=True)
-                        user_input = await loop.run_in_executor(None, sys.stdin.readline)
-                        answer = user_input.strip().lower()
-                        if answer in ['y', 'yes', 'д', 'да', 'н']:
-                            should_delete = True
-                        else:
-                            should_delete = False
-                
-                if should_delete:
-                    # Отправляем один пинг перед удалением на всякий случай
-                    logging.debug("Отправка дополнительного keep-alive ping перед началом удаления...")
-                    try:
-                        async with httpx.AsyncClient(timeout=10) as client:
-                            ping_url = f"{GOPRO_BASE_URL}/gopro/camera/keep_alive"
-                            await client.get(ping_url)
-                    except httpx.RequestError as e:
-                        logging.warning(f"Не удалось отправить ping перед удалением (камера могла уснуть): {e}")
-
-                    await delete_files_from_camera(files_on_disk_and_camera)
-                else:
-                    logging.info("Удаление файлов с камеры пропущено.")
-
+                        logging.info("Удаление файлов с камеры пропущено.")
+            
             # 6. Выключение камеры (если включено)
-            if shutdown_after_complete == 'yes' and matched_device and mode != 'process_only':
+            if all_downloads_completed and shutdown_after_complete == 'yes' and matched_device and mode != 'process_only':
                 try:
                     # Нам нужен новый клиент, т.к. старый был отключен
-                    client = await sleep_camera(None, matched_device, state)
+                    client = await sleep_camera(None, matched_device, state) # type: ignore
                     if client and client.is_connected:
                         await client.disconnect()
                         client = None # Убедимся, что он None для finally блока
@@ -1912,7 +1925,7 @@ async def main() -> None:
                     filename_format=filename_format
                 )
             elif mode == 'touch_only':
-                touch_files(Path(output_folder), downloaded_files_meta)
+                touch_files(Path(output_folder), downloaded_files_meta, ffmpeg_path) # type: ignore
             elif mode == 'download_only':
                 logging.info("Режим 'download_only': обработка файлов пропущена, как и было задано.")
         # Не выводим сообщение о пропуске, если скачивание было прервано, 
@@ -1938,13 +1951,14 @@ if __name__ == "__main__":
     exit_code = 0
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         # asyncio.run() перехватывает KeyboardInterrupt, отменяет задачу и затем снова его вызывает.
         # Так как мы обрабатываем прерывание в main(), здесь нам нужно просто тихо выйти,
         # чтобы избежать вывода "необработанного прерывания".
         pass # exit_code остается 0
-    except (RuntimeError, asyncio.TimeoutError, ValueError) as e:
-        logging.error(f"Ошибка выполнения: {e}")
+    except Exception as e:
+        # Ловим любые другие непредвиденные ошибки, которые могли произойти вне main()
+        logging.error(f"Произошла непредвиденная ошибка верхнего уровня: {e}", exc_info=True)
         exit_code = 1
     finally:
         # Если скрипт запущен как .exe, ждем нажатия клавиши или таймаута перед закрытием

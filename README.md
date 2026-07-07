@@ -28,7 +28,7 @@
 *   Настройка через удобный файл `config.ini`.
 *   Автоматический **возврат к домашней сети Wi-Fi** после завершения работы (только для Windows).
 *   **Предотвращение засыпания системы** во время работы скрипта.
-*   Скрипт полагается на **автоматическое выключение камеры** для экономии заряда.
+*   Возможность **автоматического выключения камеры** после завершения всех операций.
 
 ### 📋 Требования
 
@@ -79,6 +79,8 @@
 
 #### `[Advanced]`
 *   `wifi_wait`: Время ожидания (в секундах) при попытке подключения к Wi-Fi сети.
+*   `wifi_power_on_delay`: Пауза в секундах после включения Wi-Fi на камере. Дает время на инициализацию 5 ГГц сети для увеличения скорости.
+*   `media_port`: Порт для скачивания медиа. Для старых камер (до HERO9) - 8080. Для новых - можно оставить пустым.
 *   `auto_close_window`: Автоматически закрывать окно консоли после завершения работы (только для `.exe` версии). `yes` / `no`.
 
 #### `[Deletion]`
@@ -86,6 +88,12 @@
     *   `no`: Никогда не удалять.
     *   `ask`: Спрашивать каждый раз (по умолчанию).
     *   `yes`: Всегда удалять без запроса.
+
+#### `[Power]`
+*   `shutdown_after_complete`: Определяет, нужно ли выключать камеру после завершения всех операций.
+    *   `yes`: Выключать (по умолчанию).
+    *   `no`: Оставить включенной (она выключится сама по таймеру).
+
 
 ### ▶️ Использование
 
@@ -110,9 +118,24 @@
     ```
 
 2.  **Запустите сборку:**
+
+    **Простая команда:**
     ```bash
     pyinstaller --onefile --name GoProGraber --icon=icon.ico GP_graber.py
     ```
+    Эта команда создаст базовый `.exe` файл.
+
+    **Рекомендуемая команда (для максимальной совместимости):**
+    ```bash
+    pyinstaller --onefile --name GoProGraber --icon=icon.ico --hidden-import=bleak.backends.winrt GP_graber.py
+    ```
+    Эта команда включает флаг `--hidden-import=bleak.backends.winrt`, который решает потенциальные проблемы с работой Bluetooth на других компьютерах, где скрипт не разрабатывался.
+
+    **Продвинутая команда (для уменьшения размера .exe):**
+    ```bash
+    pyinstaller --onefile --name GoProGraber --icon=icon.ico --hidden-import=bleak.backends.winrt --exclude-module=tkinter --exclude-module=PyQt5 --exclude-module=wx GP_graber.py
+    ```
+    Эта команда дополнительно исключает большие, но неиспользуемые в проекте GUI-библиотеки, что позволяет уменьшить размер итогового файла.
 
 3.  **Подготовьте файлы для запуска:**
     *   Ваш `GoProGraber.exe` будет находиться в папке `dist`.
@@ -158,7 +181,7 @@ It connects to the camera via Bluetooth, activates Wi-Fi, downloads new files, p
 *   Configuration via a convenient `config.ini` file.
 *   Automatic **return to the home Wi-Fi network** after completion (Windows only).
 *   **Prevents the system from sleeping** while the script is running.
-*   The script relies on the camera's **auto-power-off** feature to save battery.
+*   Option to **automatically power off the camera** after all operations are complete.
 
 ### 📋 Requirements
 
@@ -209,6 +232,8 @@ On the first run, the script will automatically create a `config.ini` file. Here
 
 #### `[Advanced]`
 *   `wifi_wait`: The time to wait (in seconds) when trying to connect to a Wi-Fi network.
+*   `wifi_power_on_delay`: Pause in seconds after turning on Wi-Fi on the camera. This gives the camera time to initialize the 5 GHz network, which can increase download speed.
+*   `media_port`: The port for downloading media. For older cameras (before HERO9), use 8080. For newer ones, this can be left empty.
 *   `auto_close_window`: Automatically close the console window after completion (for the `.exe` version only). `yes` / `no`.
 
 #### `[Deletion]`
@@ -216,6 +241,12 @@ On the first run, the script will automatically create a `config.ini` file. Here
     *   `no`: Never delete.
     *   `ask`: Ask every time (default).
     *   `yes`: Always delete without prompting.
+
+#### `[Power]`
+*   `shutdown_after_complete`: Defines whether to turn off the camera after all operations are complete.
+    *   `yes`: Turn off (default).
+    *   `no`: Leave it on (it will turn off automatically based on its timer).
+
 
 ### ▶️ Usage
 
@@ -240,9 +271,24 @@ You can build the script into a single executable `.exe` file.
     ```
 
 2.  **Run the build:**
+
+    **Simple command:**
     ```bash
     pyinstaller --onefile --name GoProGraber --icon=icon.ico GP_graber.py
     ```
+    This command will create a basic `.exe` file.
+
+    **Recommended command (for maximum compatibility):**
+    ```bash
+    pyinstaller --onefile --name GoProGraber --icon=icon.ico --hidden-import=bleak.backends.winrt GP_graber.py
+    ```
+    This command includes the `--hidden-import=bleak.backends.winrt` flag, which resolves potential issues with Bluetooth functionality on other computers where the script was not developed.
+
+    **Advanced command (to reduce .exe size):**
+    ```bash
+    pyinstaller --onefile --name GoProGraber --icon=icon.ico --hidden-import=bleak.backends.winrt --exclude-module=tkinter --exclude-module=PyQt5 --exclude-module=wx GP_graber.py
+    ```
+    This command additionally excludes large, unused GUI libraries from the project, which helps to reduce the final file size.
 
 3.  **Prepare the files for running:**
     *   Your `GoProGraber.exe` will be in the `dist` folder.

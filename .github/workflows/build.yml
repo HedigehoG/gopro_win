@@ -18,7 +18,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.14'
+        python-version: '3.13'
 
     - name: Install dependencies
       run: |
@@ -26,7 +26,7 @@ jobs:
         pip install bleak httpx tqdm pyinstaller
 
     - name: Build the executable
-      run: pyinstaller --onefile --name GoProGraber --icon=icon.ico GP_graber.py
+      run: pyinstaller --onefile --name GoProGraber --icon=icon.ico --hidden-import=bleak.backends.winrt GP_graber.py
 
     - name: Create Release and Upload Asset
       uses: softprops/action-gh-release@v1
